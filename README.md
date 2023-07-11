@@ -1,6 +1,6 @@
-# Loop tracing in python.
+# A package for processing and analysis of DNA-tracing datasets in python.
 
-LoopTrace is a Python package for performing procedures of chromatin tracing in Python. Current version: 0.3.
+LoopTrace is a Python package for performing image processing and downstream analysis of DNA-tracing data in Python. Current software version: 0.3.
 
 ## Installation
 
