@@ -18,28 +18,28 @@ import tqdm
 import os
 
 class SpotPicker:
-    def __init__(self, image_handler, array_id = None):
+    def __init__(self, image_handler, roi_name = None):
         self.image_handler = image_handler
         self.config = image_handler.config
         self.images = self.image_handler.images[self.config['spot_input_name']]
         self.pos_list = self.image_handler.image_lists[self.config['spot_input_name']]
-        self.roi_path = self.image_handler.out_path+self.config['spot_input_name']+'_rois.csv'
-        self.dc_roi_path = self.image_handler.out_path+self.config['spot_input_name']+'_dc_rois.csv'
-        self.array_id = array_id
-        if self.array_id is not None:
-            self.pos_list = [self.pos_list[int(self.array_id)]]
-            self.roi_path = self.image_handler.out_path+self.config['spot_input_name']+'_rois.csv'[:-4]+'_'+str(self.array_id).zfill(4)+'.csv'
-        
-    def rois_from_spots(self, preview_pos=None):
-        '''
-        Autodetect ROIs from spot images using a manual threshold defined in config.
-        
-        Returns
-        ---------
-        A pandas DataFrame with the bounding boxes and identifyer of the detected ROIs.
-        '''
+        if roi_name == None:
+            self.roi_name = self.config['spot_input_name']
+        else:
+            self.roi_name = roi_name
+        self.roi_path = self.image_handler.out_path+self.roi_name+'_rois.csv'
+        self.dc_roi_path = self.image_handler.out_path+self.roi_name+'_dc_rois.csv'
+        if self.image_handler.pos_id is not None:
+            self.roi_path = self.image_handler.out_path+self.roi_name+'_rois.csv'[:-4]+'_'+str(self.image_handler.pos_id).zfill(4)+'.csv'
 
-        #Read parameters from config.
+    def rois_from_spots(self, preview_pos = None):
+
+        # Detects spot ROIS based on a pre-trained random forest model (training is done in separate notebook)
+        # 
+
+        from skimage.morphology import remove_small_objects
+        from skimage.segmentation import expand_labels
+        import tqdm
         
         spot_ch = self.config['spot_ch']
         if not isinstance(spot_ch, list):
@@ -47,12 +47,17 @@ class SpotPicker:
         spot_frame = self.config['spot_frame']
         if not isinstance(spot_frame, list):
             spot_frame = [spot_frame]
-        
+        spot_ds = self.config['spot_downsample']
+
         try:
-            subtract_beads = self.config['subtract_crosstalk']
-            crosstalk_ch = self.config['crosstalk_ch']
-        except KeyError: #Legacy config.
-            subtract_beads = False
+            spot_min_size = self.config['spot_min_size']
+        except KeyError:
+            spot_min_size = 3
+
+        try:
+            spot_dilate = self.config['spot_dilate']
+        except KeyError:
+            spot_dilate = 1
 
         try:
             min_dist = self.config['min_spot_dist']
@@ -60,132 +65,136 @@ class SpotPicker:
             min_dist = None
 
         try:
-            filter_nucs = self.config['spot_in_nuc']
-            if 'nuc_images_drift_correction' in self.image_handler.tables:
-                nuc_drifts = self.image_handler.tables[self.config['nuc_input_name']+'_drift_correction']
-                nuc_target_frame = self.config['nuc_ref_frame']
-                spot_drifts = self.image_handler.tables[self.config['spot_input_name']+'_drift_correction']
-            else:
-                nuc_drifts = None
-                nuc_target_frame = None
-                spot_drifts = None
+            substract_crosstalk = self.config['subtract_crosstalk']
+            crosstalk_ch = self.config['crosstalk_ch']
         except KeyError: #Legacy config.
-            filter_nucs = False
-        
-
-        spot_threshold = self.config['spot_threshold']
-        if not isinstance(spot_threshold, list):
-            spot_threshold = [spot_threshold]*len(spot_frame)
-        spot_ds = self.config['spot_downsample']
+            substract_crosstalk = False
 
         try:
-            detect_method = self.config['detection_method']
-            if detect_method == 'intensity':
-                detect_func = ip.detect_spots_int
-                print('Using intensity based spot detection with threshold ', spot_threshold)
-            else:
-                detect_func = ip.detect_spots
-                print('Using DoG based spot detection with threshold ',  spot_threshold)
-        except KeyError: #Legacy config.
-            detect_func = ip.detect_spots
-            detect_method = 'dog'
-            print('Using DoG based spot detection.')
+            crosstalk_frame = self.config['crosstalk_frame']
+        except KeyError:
+            crosstalk_frame = -1
 
-        #Loop through the imaging positions.
-        all_rois = []
-        if preview_pos is not None:
-            for i, frame in enumerate(spot_frame):
-                for j, ch in enumerate(spot_ch):
-                    print(f'Preview spot detection in position {preview_pos}, frame {frame} with threshold {spot_threshold[i]}.')
-                    pos_index = self.image_handler.image_lists[self.config['spot_input_name']].index(preview_pos)
-                    img = self.images[pos_index][frame, ch, ::spot_ds, ::spot_ds, ::spot_ds].compute()
+        try:
+            spot_threshold = self.config['spot_threshold']
+        except KeyError:
+            spot_threshold = 1000
 
-                    if subtract_beads:
-                        bead_img = self.images[pos_index][frame, crosstalk_ch, ::spot_ds, ::spot_ds, ::spot_ds].compute()
-                        img, orig = ip.subtract_crosstalk(bead_img, img, threshold=self.config['bead_threshold'])
-
-                    spot_props, filt_img = detect_func(img, spot_threshold[i], min_dist = min_dist)
-                    spot_props['position'] = preview_pos
-                    spot_props = spot_props.reset_index().rename(columns={'index':'roi_id_pos'})
-
-                    if self.config['detection_method'] != 'intensity':
-                        spot_props = ip.roi_center_to_bbox(spot_props, np.array(self.config['roi_image_size'])//spot_ds)
-                
-                    roi_points, _ = ip.roi_to_napari_points(spot_props, position=preview_pos)
-                    try:
-                        ip.napari_view(np.stack([filt_img, img, orig]), axes = 'CZYX', points=roi_points, downscale=1, name = ['DoG', 'Subtracted', 'Original'])
-                    except NameError:
-                        ip.napari_view(np.stack([filt_img, img]), axes = 'CZYX', points=roi_points, downscale=1, name = ['DoG', 'Original'])
-
-            return
-        
-        for position in tqdm.tqdm(self.pos_list):
-            pos_index = self.image_handler.image_lists[self.config['spot_input_name']].index(position)
-            for i, frame in tqdm.tqdm(enumerate(spot_frame)):
-                for j, ch in enumerate(spot_ch):
-                #print(f'Detecting spots in position {position}, frame {frame}, ch {ch}.',  end=' ')
-                    img = self.images[pos_index][frame, ch, ::spot_ds, ::spot_ds, ::spot_ds].compute()
-                    if subtract_beads:
-                        bead_img = self.images[pos_index][frame, crosstalk_ch, ::spot_ds, ::spot_ds, ::spot_ds].compute()
-                        img, _ = ip.subtract_crosstalk(bead_img, img, threshold=self.config['bead_threshold'])
-                    spot_props, _ = detect_func(img, spot_threshold[i], min_dist = min_dist)
-
-                    if self.config['detection_method'] != 'intensity':
-                        spot_props = ip.roi_center_to_bbox(spot_props, np.array(self.config['roi_image_size'])//spot_ds)
-
-                    spot_props[['z_min', 'y_min', 'x_min', 'z_max', 'y_max', 'x_max', 'zc', 'yc', 'xc']] = spot_props[['z_min', 'y_min', 'x_min', 'z_max', 'y_max', 'x_max', 'zc', 'yc', 'xc']]*spot_ds
-                    
-                    spot_props['position'] = position
-                    spot_props['frame'] = frame
-                    spot_props['ch'] = ch
-                    all_rois.append(spot_props)
-        output = pd.concat(all_rois)
-
-        print(f'Found {len(output)} spots.')
-
-        if filter_nucs:
-            if 'nuc_masks' not in self.image_handler.images:
-                print('No nuclei mask images found, cannot filter.')
-            else:
-                print('Filtering in nuclei.')
-                if self.array_id is None:
-                    nuc_masks = [a[0,0] for a in self.image_handler.images['nuc_masks']]
-                else:
-                    nuc_masks = [self.image_handler.images['nuc_masks'][pos_index][0,0]]
-
-                output = ip.filter_rois_in_nucs(output, nuc_masks, self.pos_list, new_col='nuc_label', nuc_drifts=nuc_drifts, nuc_target_frame=nuc_target_frame, spot_drifts = spot_drifts)
-                output = output[output['nuc_label'] > 0 ]
+        if not isinstance(spot_threshold, list):
+            spot_threshold = [spot_threshold]*len(spot_frame)
             
-            if 'nuc_classes' in self.image_handler.images:
-                print('Assigning nucleus classes.')
-                if self.array_id is None:
-                    nuc_classes = [a[0,0] for a in self.image_handler.images['nuc_classes']]
-                else:
-                    nuc_classes = [self.image_handler.images['nuc_classes'][pos_index][0,0]]
-                output = ip.filter_rois_in_nucs(output, nuc_classes, self.pos_list, new_col='nuc_class', nuc_drifts=nuc_drifts, nuc_target_frame=nuc_target_frame, spot_drifts = spot_drifts)
+        try:
+            detect_method = self.config['detection_method']
+        except KeyError: #Legacy config.
+            detect_method = 'dog'
 
-        output=output.reset_index().rename(columns={'index':'roi_id_pos'})
-        if detect_method == 'dog':
-            rois = ip.roi_center_to_bbox(output, roi_size = tuple(self.config['roi_image_size']))
-        else:
-            rois = output
+        rois = []
 
+
+        for i, pos in tqdm.tqdm(enumerate(self.pos_list)):
+            for j, frame in tqdm.tqdm(enumerate(spot_frame)):
+                for k, ch in enumerate(spot_ch):
+                #print(f'Detecting spots in position {position}, frame {frame}, ch {ch}.',  end=' ')
+                    img = self.images[i][frame, ch, ::spot_ds, ::spot_ds, ::spot_ds].compute()
+
+                    if substract_crosstalk:
+                        if crosstalk_frame == -1:
+                            crosstalk_img = self.images[i][frame, crosstalk_ch, ::spot_ds, ::spot_ds, ::spot_ds].compute()
+                        else:
+                            crosstalk_img = self.images[i][crosstalk_frame, crosstalk_ch, ::spot_ds, ::spot_ds, ::spot_ds].compute()
+                        img, _ = ip.subtract_crosstalk(img, crosstalk_img, threshold=0)
+
+                    if detect_method == 'rf':
+                        import pickle
+                        from skimage import feature, future
+                        from functools import partial
+                        sigma_min = 1
+                        sigma_max = 16
+                        features_func = partial(feature.multiscale_basic_features,
+                                                intensity=True, edges=True, texture=False,
+                                                sigma_min=sigma_min, sigma_max=sigma_max)
+                        clf = pickle.load(open(os.path.dirname(self.image_handler.out_path)+os.sep+'spots_rf_model.pickle', 'rb'))
+                        features = features_func(img)
+                        mask = future.predict_segmenter(features, clf)
+                        mask = mask - 1
+                    
+                    elif detect_method == 'intensity':
+                        mask = img > spot_threshold[j]
+                    elif detect_method == 'sbr':
+                        mask = img > (spot_threshold[j] * np.median(img))
+                    elif detect_method == 'dog':
+                        from skimage.filters import gaussian
+                        #img = white_tophat(image=input_img, footprint=ball(2))
+                        filt_img = gaussian(img, 0.8)-gaussian(img,1.3)
+                        filt_img = filt_img/gaussian(filt_img, 3)
+                        filt_img = (filt_img-np.mean(filt_img))/np.std(filt_img)
+                        mask = filt_img > spot_threshold[j]
+
+                    else:
+                        print('Unknown spot detection method, returning.')
+
+
+                    struct = ndi.generate_binary_structure(img.ndim, 2)
+                    labels, n_obj = ndi.label(mask, structure=struct)
+
+                    if n_obj > 1: #Do not need this with area filtering below.
+                        labels = remove_small_objects(labels, min_size=spot_min_size)
+                        labels = expand_labels(labels, spot_dilate)
+                    
+                    if preview_pos is not None:
+                        import napari
+                        n = napari.view_image(img)
+                        n.add_labels(labels)
+                        input('Press any key to to proceed.')
+                        return
+
+                    if np.all(labels == 0): #If there are no labels anymore:
+                        return pd.DataFrame(columns=['label', 'z_min','y_min','x_min','z_max','y_max','x_max','area','zc','yc','xc','intensity_mean']), labels
+                    else:
+                        spot_props = regionprops_table(labels, img, properties=('label', 'bbox', 'area', 'centroid_weighted', 'intensity_mean'))
+                        spot_props = pd.DataFrame(spot_props)
+                        #spot_props = spot_props.query('area > 10')
+
+                        spot_props = spot_props.rename(columns={'centroid_weighted-0': 'zc',
+                                                            'centroid_weighted-1': 'yc',
+                                                            'centroid_weighted-2': 'xc',
+                                                            'bbox-0': 'z_min',
+                                                            'bbox-1': 'y_min',
+                                                            'bbox-2': 'x_min',
+                                                            'bbox-3': 'z_max',
+                                                            'bbox-4': 'y_max',
+                                                            'bbox-5': 'x_max'})
+                    
+                        spot_props = spot_props.reset_index(drop=True)
+                        spot_props = spot_props.rename(columns={'index':'roi_id'})
+                        spot_props[['z_min', 'y_min', 'x_min', 'z_max', 'y_max', 'x_max', 'zc', 'yc', 'xc']] = spot_props[['z_min', 'y_min', 'x_min', 'z_max', 'y_max', 'x_max', 'zc', 'yc', 'xc']]*spot_ds
+                    
+                        spot_props['position'] = pos
+                        spot_props['frame'] = frame
+                        spot_props['ch'] = ch
+                        print(f'Found {str(len(spot_props))} spots in position {pos}, frame {str(frame)}, channel {str(ch)}.')
+                        rois.append(spot_props)
+
+        rois = pd.concat(rois)
         rois = rois.sort_values(['position', 'frame'])
         rois.to_csv(self.roi_path)
         self.image_handler.load_tables()
+
         print(f'Filtering complete, {len(rois)} ROIs after filtering.')
-        
-        return rois
+
 
     def rois_from_beads(self):
+
+        # Detect bead ROIS based on drift correction parameters in config.
+
         print('Detecting bead ROIs for tracing.')
         all_rois = []
         n_fields = self.config['bead_trace_fields']
         n_beads = self.config['bead_trace_number']
-        for pos in tqdm.tqdm(random.sample(self.pos_list, k=n_fields)):
+        for pos in tqdm.tqdm(sorted(random.sample(self.pos_list, k=n_fields))):
             pos_index = self.image_handler.image_lists[self.config['spot_input_name']].index(pos)
-            ref_frame = self.config['bead_reference_frame']
-            ref_ch = self.config['bead_ch']
+            ref_frame = self.config['reg_ref_frame']
+            ref_ch = self.config['reg_ch_template']
             threshold = self.config['bead_threshold']
             min_bead_int = self.config['min_bead_intensity']
 
@@ -212,112 +221,135 @@ class SpotPicker:
             all_rois.append(spot_props)
         
         output = pd.concat(all_rois)
-        output=output.reset_index().rename(columns={'index':'roi_id'})
-        rois = ip.roi_center_to_bbox(output, roi_size = tuple(self.config['roi_image_size']))
+        output=output.reset_index().rename(columns={'index':'roi_id'}).sort_values(['position', 'frame', 'roi_id'])
+        rois = ip.roi_center_to_bbox(output, roi_size = self.config['bead_roi_size'])
 
         self.image_handler.bead_rois = rois
         rois.to_csv(self.roi_path+'_beads.csv')
         self.image_handler.load_tables()
         return rois
-    '''
-    def refilter_rois(self):
-        #TODO needs updating to new table syntax.
-        if self.config['detection_method'] == 'dog':
-            self.image_handler.roi_table = ip.roi_center_to_bbox(self.image_handler.roi_table.copy(), roi_size = tuple(self.config['roi_image_size']))
-        
-        self.image_handler.roi_table[['z_min', 'y_min', 'x_min', 'z_max', 'y_max', 'x_max', 'zc', 'yc', 'xc']] = self.image_handler.roi_table[['z_min', 'y_min', 'x_min', 'z_max', 'y_max', 'x_max', 'zc', 'yc', 'xc']].round().astype(int)
+    
+    def remove_nearby_rois(self):
+        print('Filtering rois to remove proximal rois.')
+        try:
+            preserve = self.config['preserve_spot']
+        except KeyError:
+            preserve = 'brightest'
 
-        if 'nuc_images' not in self.image_handler.images:
-            print('Please generate nuclei images first.')
-        if 'nuc_masks' in self.image_handler.images:
-            self.image_handler.roi_table = ip.filter_rois_in_nucs(self.image_handler.roi_table.copy(), np.array(self.image_handler.images['nuc_masks']), self.pos_list, new_col='nuc_label', drifts = self.image_handler.tables['nuc_images_drift_correction'], target_frame=self.config['nuc_ref_frame'])
-            
-        if 'nuc_classes' in self.image_handler.images:
-            self.image_handler.roi_table = ip.filter_rois_in_nucs(self.image_handler.roi_table.copy(), np.array(self.image_handler.images['nuc_classes']), self.pos_list, new_col='nuc_class', drifts = self.image_handler.tables['nuc_images_drift_correction'], target_frame=self.config['nuc_ref_frame'])
+        all_rois = []
+        roi_table = self.image_handler.tables[self.roi_name+'_rois']
+        for position, pos_rois in roi_table.copy().groupby('position'):
+            if self.config['spot_input_name']+'_drift_correction' in self.image_handler.tables:
+                frames = sorted(list(pos_rois['frame'].unique()))
+                for i, frame in enumerate(frames):
+                    sel_dc = self.image_handler.tables[self.config['spot_input_name']+'_drift_correction'].query('position == @position & frame == @frame')[['z_px_course', 'y_px_course', 'x_px_course']].to_numpy()
+                    #print(sel_dc, pos_rois)
+                    pos_rois.loc[pos_rois['frame'] == frame, ['zc', 'yc', 'xc']] = pos_rois.loc[pos_rois['frame'] == frame, ['zc', 'yc', 'xc']] - sel_dc
+                    #print(sel_dc, pos_rois)
+                print('Drift correction applied, resulting rois: ', pos_rois)
+            else:
+                print('No drift correction applied, continuing.')
+                pass
 
-        print('ROIs (re)assigned to nuclei.')
-        self.image_handler.roi_table.to_csv(self.roi_path)
+            if preserve == 'brightest':
+                weights = pos_rois['intensity_mean'].to_numpy()
+            else:
+                weights = None
+
+            remove_idx = ip.get_indexes_of_nearby_rois(pos_rois[['zc', 'yc', 'xc']].to_numpy(), min_dist = self.config['min_spot_dist'], weights = weights)
+            #print('Removing overlapping ROIs at following indexes: ', position, remove_idx, remove_idx.shape, pos_rois)
+            new_rois = roi_table[roi_table['position']==position].reset_index(drop=True).drop(remove_idx).reset_index(drop=True) #Reset the index to fit with the index from the function above.
+            all_rois.append(new_rois)
+        all_rois = pd.concat(all_rois).reset_index(drop=True)
+        all_rois.to_csv(self.roi_path)
         self.image_handler.load_tables()
-    '''
+
     def make_dc_rois_all_frames(self):
         #Precalculate all ROIs for extracting spot images, based on identified ROIs and precalculated drifts between time frames.
         print('Generating list of all ROIs for tracing:')
+        try:
+            spot_extract_ch = self.config['spot_extract_ch']
+        except KeyError:
+            spot_extract_ch = self.config['spot_ch']
+        if not isinstance(spot_extract_ch, list):
+            spot_extract_ch = [spot_extract_ch]
         #positions = sorted(list(self.roi_table.position.unique()))
-
         all_rois = []
-        for i, roi in tqdm.tqdm(self.image_handler.tables[self.config['spot_input_name']+'_rois'].iterrows(), total=len(self.image_handler.tables[self.config['spot_input_name']+'_rois'])):
+        for i, roi in tqdm.tqdm(self.image_handler.tables[self.roi_name+'_rois'].iterrows(), total=len(self.image_handler.tables[self.roi_name+'_rois'])):
             pos = roi['position']
             pos_index = self.image_handler.image_lists[self.config['spot_input_name']].index(pos)#positions.index(pos)
             dc_pos_name = self.image_handler.image_lists[self.config['reg_input_moving']][pos_index]
             sel_dc = self.image_handler.tables[self.config['spot_input_name']+'_drift_correction'].query('position == @dc_pos_name')
             ref_frame = roi['frame']
-            ch = roi['ch']
+
             ref_offset = sel_dc.query('frame == @ref_frame')
-            Z, Y, X = self.images[pos_index][0,ch].shape[-3:]
-            for j, dc_frame in sel_dc.iterrows():
-                z_drift_course = int(dc_frame['z_px_course']) - int(ref_offset['z_px_course'])
-                y_drift_course = int(dc_frame['y_px_course']) - int(ref_offset['y_px_course'])
-                x_drift_course = int(dc_frame['x_px_course']) - int(ref_offset['x_px_course'])
 
-                z_min = max(roi['z_min'] - z_drift_course, 0)
-                z_max = min(roi['z_max'] - z_drift_course, Z)
-                y_min = max(roi['y_min'] - y_drift_course, 0)
-                y_max = min(roi['y_max'] - y_drift_course, Y)
-                x_min = max(roi['x_min'] - x_drift_course, 0)
-                x_max = min(roi['x_max'] - x_drift_course, X)
+            for ch in spot_extract_ch:
+                Z, Y, X = self.images[pos_index][0,ch].shape[-3:]
+                for j, dc_frame in sel_dc.iterrows():
+                    z_drift_course = int(dc_frame['z_px_course']) - int(ref_offset['z_px_course'])
+                    y_drift_course = int(dc_frame['y_px_course']) - int(ref_offset['y_px_course'])
+                    x_drift_course = int(dc_frame['x_px_course']) - int(ref_offset['x_px_course'])
 
-                pad_z_min = abs(min(0,z_min))
-                pad_z_max = abs(max(0,z_max-Z))
-                pad_y_min = abs(min(0,y_min))
-                pad_y_max = abs(max(0,y_max-Y))
-                pad_x_min = abs(min(0,x_min))
-                pad_x_max = abs(max(0,x_max-X))
+                    z_min = max(roi['z_min'] - z_drift_course, 0)
+                    z_max = min(roi['z_max'] - z_drift_course, Z)
+                    y_min = max(roi['y_min'] - y_drift_course, 0)
+                    y_max = min(roi['y_max'] - y_drift_course, Y)
+                    x_min = max(roi['x_min'] - x_drift_course, 0)
+                    x_max = min(roi['x_max'] - x_drift_course, X)
 
-                #print('Appending ', s)
-                all_rois.append([pos, pos_index, roi.name, dc_frame['frame'], ref_frame, ch, 
-                                z_min, z_max, y_min, y_max, x_min, x_max, 
-                                pad_z_min, pad_z_max, pad_y_min, pad_y_max, pad_x_min, pad_x_max,
-                                z_drift_course, y_drift_course, x_drift_course, 
-                                dc_frame['z_px_fine'], dc_frame['y_px_fine'], dc_frame['x_px_fine']])
+                    pad_z_min = abs(min(0,z_min))
+                    pad_z_max = abs(max(0,z_max-Z))
+                    pad_y_min = abs(min(0,y_min))
+                    pad_y_max = abs(max(0,y_max-Y))
+                    pad_x_min = abs(min(0,x_min))
+                    pad_x_max = abs(max(0,x_max-X))
 
-        self.all_rois = pd.DataFrame(all_rois, columns=['position', 'pos_index', 'roi_id', 'frame', 'ref_frame', 'ch', 
+                    #print('Appending ', s)
+                    all_rois.append([pos, pos_index, roi.name, dc_frame['frame'], ref_frame, roi.ch, ch, 
+                                    z_min, z_max, y_min, y_max, x_min, x_max, 
+                                    pad_z_min, pad_z_max, pad_y_min, pad_y_max, pad_x_min, pad_x_max,
+                                    z_drift_course, y_drift_course, x_drift_course, 
+                                    dc_frame['z_px_fine'], dc_frame['y_px_fine'], dc_frame['x_px_fine']])
+
+        self.all_rois = pd.DataFrame(all_rois, columns=['position', 'pos_index', 'roi_id', 'frame', 'ref_frame', 'ref_ch', 'trace_ch', 
                                 'z_min', 'z_max', 'y_min', 'y_max', 'x_min', 'x_max',
                                 'pad_z_min', 'pad_z_max', 'pad_y_min', 'pad_y_max', 'pad_x_min', 'pad_x_max', 
                                 'z_px_course', 'y_px_course', 'x_px_course',
                                 'z_px_fine', 'y_px_fine', 'x_px_fine'])
-        self.all_rois = self.all_rois.sort_values(['roi_id','frame'])
+        self.all_rois = self.all_rois.sort_values(['roi_id','frame']).reset_index(drop=True)
         print(self.all_rois)
         self.all_rois.to_csv(self.dc_roi_path)
         self.image_handler.load_tables()
 
-    def extract_single_roi_img(self, single_roi):
-        #Function to extract single ROI lazily without loading entire stack in RAM.
-        #Depending on chunking of original data can be more or less performant.
+    # def extract_single_roi_img(self, single_roi):
+    #     #Function to extract single ROI lazily without loading entire stack in RAM.
+    #     #Depending on chunking of original data can be more or less performant.
 
-        roi_image_size = tuple(self.config['roi_image_size'])
-        p = single_roi['pos_index']
-        t = single_roi['frame']
-        c = single_roi['ch']
-        z = slice(single_roi['z_min'], single_roi['z_max'])
-        y = slice(single_roi['y_min'], single_roi['y_max'])
-        x = slice(single_roi['x_min'], single_roi['x_max'])
-        pad = ( (single_roi['pad_z_min'], single_roi['pad_z_max']),
-                (single_roi['pad_y_min'], single_roi['pad_y_max']),
-                (single_roi['pad_x_min'], single_roi['pad_x_max']))
+    #     roi_image_size = tuple(self.config['roi_image_size'])
+    #     p = single_roi['pos_index']
+    #     t = single_roi['frame']
+    #     c = single_roi['ch']
+    #     z = slice(single_roi['z_min'], single_roi['z_max'])
+    #     y = slice(single_roi['y_min'], single_roi['y_max'])
+    #     x = slice(single_roi['x_min'], single_roi['x_max'])
+    #     pad = ( (single_roi['pad_z_min'], single_roi['pad_z_max']),
+    #             (single_roi['pad_y_min'], single_roi['pad_y_max']),
+    #             (single_roi['pad_x_min'], single_roi['pad_x_max']))
 
-        try:
-            roi_img = np.array(self.images[p][t, c, z, y, x])
+    #     try:
+    #         roi_img = np.array(self.images[p][t, c, z, y, x])
 
-            #If microscope drifted, ROI could be outside image. Correct for this:
-            if pad != ((0,0),(0,0),(0,0)):
-                #print('Padding ', pad)
-                roi_img = np.pad(roi_img, pad, mode='edge')
+    #         #If microscope drifted, ROI could be outside image. Correct for this:
+    #         if pad != ((0,0),(0,0),(0,0)):
+    #             #print('Padding ', pad)
+    #             roi_img = np.pad(roi_img, pad, mode='edge')
 
-        except ValueError: # ROI collection failed for some reason
-            roi_img = np.zeros(roi_image_size, dtype=np.float32)
+    #     except ValueError: # ROI collection failed for some reason
+    #         roi_img = np.zeros(roi_image_size, dtype=np.float32)
 
-        #print(p, t, c, z, y, x)
-        return roi_img  #{'p':p, 't':t, 'c':c, 'z':z, 'y':y, 'x':x, 'img':roi_img}
+    #     #print(p, t, c, z, y, x)
+    #     return roi_img  #{'p':p, 't':t, 'c':c, 'z':z, 'y':y, 'x':x, 'img':roi_img}
 
     def extract_single_roi_img_inmem(self, single_roi, images):
         # Function for extracting a single cropped region defined by ROI from a larger 3D image.
@@ -333,6 +365,7 @@ class SpotPicker:
 
             #If microscope drifted, ROI could be outside image. Correct for this:
             if pad != ((0,0),(0,0),(0,0)):
+                print('Padding.')
                 roi_img = np.pad(roi_img, pad, mode='edge')
 
         except ValueError: # ROI collection failed for some reason
@@ -342,38 +375,46 @@ class SpotPicker:
 
     def gen_roi_imgs_inmem(self):
         from numpy.lib.format import open_memmap
+        try:
+            spot_extract_name = self.config['spot_extract_name']
+        except KeyError:
+            spot_extract_name = self.config['spot_input_name']
+        try:
+            spot_extract_ch = self.config['spot_extract_ch']
+        except KeyError:
+            spot_extract_ch = self.config['spot_ch']
+        if not isinstance(spot_extract_ch, list):
+            spot_extract_ch = [spot_extract_ch]
+
         # Load full stacks into memory to extract spots.
         # Not the most elegant, but depending on the chunking of the original data it is often more performant than loading subsegments.
-
-        rois = self.image_handler.tables[self.config['spot_input_name']+'_dc_rois']
-        if self.array_id is not None:
-            pos_name = self.image_handler.image_lists[self.config['spot_input_name']][self.array_id]
-            rois = rois[rois.position == pos_name]
-
+        rois = self.image_handler.tables[self.roi_name+'_dc_rois']
 
         if not os.path.isdir(self.image_handler.image_save_path+os.sep+'spot_images_dir'):
             os.mkdir(self.image_handler.image_save_path+os.sep+'spot_images_dir')
 
-        for pos, pos_group in tqdm.tqdm(rois.groupby('position')):
+        for pos, pos_group in tqdm.tqdm(rois[rois.position.isin(self.pos_list)].groupby('position')):
             pos_index = self.image_handler.image_lists[self.config['spot_input_name']].index(pos)
             #print(full_image.shape)
             f_id = 0
             n_frames = len(pos_group.frame.unique())
+            n_ch = len(pos_group.trace_ch.unique())
             #print(n_frames)
             for frame, frame_group in tqdm.tqdm(pos_group.groupby('frame')):
-                for ch, ch_group in frame_group.groupby('ch'):
-                    image_stack = np.array(self.images[pos_index][int(frame), int(ch)])
+                ch_id = 0
+                for ch, ch_group in tqdm.tqdm(frame_group.groupby('trace_ch')):
+                    image_stack = np.array(self.image_handler.images[spot_extract_name][pos_index][int(frame), int(ch)])
                     for i, roi in ch_group.iterrows():
                         roi_img = self.extract_single_roi_img_inmem(roi, image_stack).astype(np.uint16)
                         fn = self.image_handler.image_save_path+os.sep+'spot_images_dir'+os.sep+str(pos)+'_'+str(roi['roi_id']).zfill(5)+'.npy'
                         if f_id == 0:
-                            arr = open_memmap(fn, mode='w+', dtype = roi_img.dtype, shape=(n_frames,)+roi_img.shape)
-                            arr[f_id] = roi_img
+                            arr = open_memmap(fn, mode='w+', dtype = roi_img.dtype, shape=(n_frames,n_ch)+roi_img.shape)
+                            arr[f_id, ch_id] = roi_img
                             arr.flush()
                         else:
                             arr = open_memmap(fn, mode='r+')
                             try:
-                                arr[f_id] = roi_img
+                                arr[f_id, ch_id] = roi_img
                                 arr.flush()
                                 #arr[f_id] = np.append(arr[f_id], np.expand_dims(roi_img,0).copy(), axis=0)
                             except ValueError: #Edge case: ROI fetching has failed giving strange shaped ROI, just leave the zeros as is.
@@ -382,10 +423,11 @@ class SpotPicker:
                         #np.save(self.config['image_path']+os.sep+'spot_images_dir'+os.sep+rn+'.npy', roi_stack)
                         #print(roi_array)
                         #roi_array_padded.append(ip.pad_to_shape(roi, shape = roi_image_size, mode = 'minimum'))
+                    ch_id += 1
                 f_id += 1
-        if self.array_id is None: #Only do this if not running distributed, otherwise need to collect and zip later.
-            image_io.zip_folder(self.image_handler.image_save_path+os.sep+'spot_images_dir', 'spot_images.npz', remove_folder = True)
-            self.image_handler.images['spot_images'] = image_io.NPZ_wrapper(self.image_handler.image_save_path+os.sep+'spot_images.npz')
+        #if self.image_handler.pos_id is None: #Only do this if not running distributed, otherwise need to collect and zip later.
+        #    image_io.zip_folder(self.image_handler.image_save_path+os.sep+'spot_images_dir', 'spot_images.npz', remove_folder = True)
+        #    self.image_handler.images['spot_images'] = image_io.NPZ_wrapper(self.image_handler.image_save_path+os.sep+'spot_images.npz')
 
             
             #for j, pos_roi in enumerate(pos_rois):
@@ -417,6 +459,8 @@ class SpotPicker:
         #np.save(self.image_handler.spot_images_path+os.sep+'spot_images_padded.npy', roi_array_padded)
 
     def gen_roi_imgs_inmem_coursedc(self):
+        #TODO: Update to multichannel tracing!
+        
         # Use this simplified function if the images that the spots are gathered from are already coursely drift corrected!
         #rois = self.roi_table#.iloc[0:500]
         #imgs = self.
@@ -436,7 +480,7 @@ class SpotPicker:
                 fn = pos+'_'+str(roi['frame'])+'_'+str(roi['roi_id_pos']).zfill(4)
                 np.save(self.image_handler.image_save_path+os.sep+'spot_images_dir'+os.sep+fn+'.npy', spot_stack)
         #self.image_handler.images['spot_images'] = all_spots
-        if self.array_id is None: #Only do this if not running distributed, otherwise need to collect and zip later.
+        if self.image_handler.pos_id is None: #Only do this if not running distributed, otherwise need to collect and zip later.
             image_io.zip_folder(self.image_handler.image_save_path+os.sep+'spot_images_dir', 'spot_images.npz', remove_folder = True)
             self.image_handler.images['spot_images'] = image_io.NPZ_wrapper(self.image_handler.image_save_path+os.sep+'spot_images.npz')
         #np.savez_compressed(self.config['image_path']+os.sep+'spot_images.npz', **all_spots)
@@ -458,7 +502,7 @@ class SpotPicker:
 
         imgs = self.image_handler.images['spot_images']
         
-        rois = self.all_rois
+        rois = self.image_handler.tables[self.roi_name+'_dc_rois']
 
         i = 0
         roi_array_fine = []

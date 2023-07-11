@@ -1,14 +1,5 @@
-"""
-Created by:
-
-Kai Sandvold Beckwith
-Ellenberg group
-EMBL Heidelberg
-"""
-
 from looptrace.ImageHandler import ImageHandler
-from looptrace.SpotPicker import SpotPicker
-import os
+from looptrace.NucDetector import NucDetector
 import argparse
 
 if __name__ == '__main__':
@@ -17,10 +8,6 @@ if __name__ == '__main__':
     parser.add_argument("--image_path", help="Path to folder with images to read.")
     parser.add_argument("--image_save_path", help="(Optional): Path to folder to save images to.", default=None)
     args = parser.parse_args()
-    try:
-        array_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-    except KeyError:
-        array_id = None
-    H = ImageHandler(config_path=args.config_path, image_path=args.image_path, image_save_path=args.image_save_path, pos_id = array_id)
-    S = SpotPicker(H)
-    S.rois_from_spots()
+    H = ImageHandler(config_path=args.config_path, image_path=args.image_path, image_save_path=args.image_save_path)
+    N = NucDetector(H)
+    N.gen_nuc_images()

@@ -12,12 +12,11 @@ import argparse
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Preview spot detection in given position.')
-    parser.add_argument("config_path", help="Config file path")
-    parser.add_argument("image_path", help="Path to folder with images to read.")
+    parser.add_argument("--config_path", help="Config file path")
+    parser.add_argument("--image_path", help="Path to folder with images to read.")
     parser.add_argument('--position', help='(Optional): Index of position to view.', default='0')
 
     args = parser.parse_args()
-    H = ImageHandler(config_path=args.config_path, image_path=args.image_path)
+    H = ImageHandler(config_path=args.config_path, image_path=args.image_path, pos_id=int(args.position))
     S = SpotPicker(H)
-    preview_pos = H.image_lists[H.config['spot_input_name']][int(args.position)]
-    S.rois_from_spots(preview_pos=preview_pos)
+    S.rois_from_spots(preview_pos=int(args.position))

@@ -17,6 +17,7 @@ from skimage.segmentation import expand_labels, relabel_sequential
 from skimage.measure import regionprops_table
 from skimage.transform import rescale
 from skimage.morphology import remove_small_objects
+from scipy import ndimage as ndi
 import tqdm
 
 class NucDetector:
@@ -24,7 +25,7 @@ class NucDetector:
     Class for handling generation and detection of e.g. nucleus images.
     '''
 
-    def __init__(self, image_handler, array_id = None):
+    def __init__(self, image_handler):
         self.image_handler = image_handler
         self.config = image_handler.config
         try:
@@ -35,9 +36,6 @@ class NucDetector:
         self.nuc_images_path = self.image_handler.image_save_path+os.sep+'nuc_images'
         self.nuc_masks_path = self.image_handler.image_save_path+os.sep+'nuc_masks'
         self.nuc_classes_path = self.image_handler.image_save_path+os.sep+'nuc_classes'
-
-        if array_id is not None:
-            self.pos_list = [self.pos_list[int(array_id)]]
 
     def gen_nuc_images(self):
         '''
@@ -54,25 +52,69 @@ class NucDetector:
         
         print('Generating nuclei images.')
         imgs = []
-        for pos in tqdm.tqdm(self.pos_list):
-            pos_index = self.pos_list.index(pos)
+        for i, pos in tqdm.tqdm(enumerate(self.pos_list)):
+            if nuc_3d:
+                img = self.images[i][self.config['nuc_ref_frame'], self.config['nuc_channel']].compute()
+            elif nuc_slice == -1:
+                img = da.max(self.images[i][self.config['nuc_ref_frame'], self.config['nuc_channel']], axis=0).compute()
+            else:
+                img = self.images[i][self.config['nuc_ref_frame'], self.config['nuc_channel'], self.config['nuc_slice']].compute()
 
             if nuc_3d:
-                img = self.images[pos_index][self.config['nuc_ref_frame'], self.config['nuc_channel']].compute()
-            elif nuc_slice == -1:
-                img = da.max(self.images[pos_index][self.config['nuc_ref_frame'], self.config['nuc_channel']], axis=0).compute()
+                image_io.single_position_to_zarr(img, path=self.nuc_images_path, name = 'nuc_images', pos_name=pos, axes=('z','y','x'), dtype=np.uint16, chunk_split=(1,1))
             else:
-                img = self.images[pos_index][self.config['nuc_ref_frame'], self.config['nuc_channel'], self.config['nuc_slice']].compute()
-            imgs.append(img.astype(np.uint16))
-
-        if nuc_3d:
-            image_io.images_to_ome_zarr(images=imgs, path=self.nuc_images_path, name='nuc_images', axes=('p','z','y','x'), chunk_split=(1,1), dtype = np.uint16)
-        else:
-            image_io.images_to_ome_zarr(images=imgs, path=self.nuc_images_path, name='nuc_images', axes=('p','y','x'), chunk_split=(1,1), dtype = np.uint16)
-        
-        del imgs #Cleanup RAM
+                image_io.single_position_to_zarr(img, path=self.nuc_images_path, name = 'nuc_images', pos_name=pos, axes=('y','x'), dtype=np.uint16, chunk_split=(1,1))
 
     def segment_nuclei(self):
+        seg_method = self.config['nuc_method']
+        if seg_method == 'threshold':
+            print('Segmenting nuclei by threshold method.')
+            self.segment_nuclei_threshold()
+        elif seg_method == 'rf':
+            print('Segmenting nuclei by random forest method.')
+            self.segment_nuclei_rf()
+        elif seg_method == 'cellpose':
+            print('Segmenting nuclei by Cellpose.')
+            self.segment_nuclei_cellpose()
+        else:
+            print('Selected segmentation method not implemented.')
+
+    def segment_nuclei_rf(self):
+        from skimage.segmentation import expand_labels
+        from skimage.transform import rescale
+        import pickle
+        from skimage import feature, future
+        from functools import partial
+        import tqdm
+
+        sigma_min = 1
+        sigma_max = 16
+        features_func = partial(feature.multiscale_basic_features,
+                            intensity=True, edges=False, texture=True,
+                            sigma_min=sigma_min, sigma_max=sigma_max)
+
+        clf = pickle.load(open(os.path.dirname(self.image_handler.out_path)+os.sep+'nuc_rf_model.pickle', 'rb'))
+        for i, pos in tqdm.tqdm(enumerate(self.pos_list)):
+            img = np.array(self.image_handler.images['nuc_images'][i][0,0,::2,::2,::2])
+            features = features_func(img)
+            mask = future.predict_segmenter(features, clf)
+            mask = mask - 1
+            mask = ndi.label(mask)[0]
+            mask = rescale(expand_labels(mask.astype(np.uint16),self.config['nuc_dilation']), scale = (2, 2, 2), order = 0)
+            image_io.single_position_to_zarr(mask, path = self.nuc_masks_path, name = 'nuc_mask', pos_name=pos, axes=('z','y','x'), dtype = np.uint16, chunk_split=(1,1))
+
+    def segment_nuclei_threshold(self):
+        for i, pos in tqdm.tqdm(enumerate(self.pos_list)):
+            img = np.array(self.image_handler.images['nuc_images'][i][0,0,::2,::2,::2])
+            img = ndi.gaussian_filter(img, 2)
+            mask = img > int(self.config['nuc_threshold'])
+            mask = ndi.binary_fill_holes(mask)
+            mask = remove_small_objects(mask, min_size=self.config['nuc_min_size']).astype(np.uint16)
+            mask = ndi.label(mask)[0]
+            mask = rescale(expand_labels(mask.astype(np.uint16),self.config['nuc_dilation']), scale = (2, 2, 2), order = 0)
+            image_io.single_position_to_zarr(mask, path = self.nuc_masks_path, name = 'nuc_mask', pos_name=pos, axes=('z','y','x'), dtype = np.uint16, chunk_split=(1,1))
+
+    def segment_nuclei_cellpose(self):
         '''
         Runs nucleus segmentation using nucleus segmentation algorithm defined in ip functions.
         Dilates a bit and saves images.
@@ -84,7 +126,7 @@ class NucDetector:
         print('Segmenting nuclei.')
         
         try:
-            method = self.config['nuc_method']
+            method = self.config['nuc_cellpose_model']
         except KeyError:
             method = 'nuclei'
         try:
@@ -111,15 +153,12 @@ class NucDetector:
         nuc_imgs_in = self.image_handler.images['nuc_images']
         nuc_imgs = []
 
-        #Remove unused dimensions and downscale input images.
-        for img in nuc_imgs_in:        
-            new_slice = tuple([0 if i == 1 else slice(None) for i in img.shape])
-            img = img[new_slice]
+        #Remove unused dimensions and downscale input images.        
+        for i, pos in tqdm.tqdm(enumerate(self.pos_list)):
             if nuc_3d:
-                img = np.array(img[::ds_z, ::ds_xy, ::ds_xy])
+                nuc_imgs.append(np.array(self.image_handler.images['nuc_images'][i][0,0,::ds_z,::ds_xy,::ds_xy]))
             else:
-                img = np.array(img[::ds_xy,::ds_xy])
-            nuc_imgs.append(img)
+                nuc_imgs.append(np.array(self.image_handler.images['nuc_images'][i][0,0,0,::ds_xy,::ds_xy]))
         
         print(f'Running nuclear segmentation using CellPose {method} model and diameter {diameter}.')
 
@@ -166,6 +205,50 @@ class NucDetector:
             else:
                 image_io.images_to_ome_zarr(images=nuc_class, path=self.nuc_classes_path, name='nuc_classes', axes=('p','y','x'), dtype = np.uint16, chunk_split=(1,1))
 
+    def classify_nuclei(self, default_class = 1):
+        '''
+        #from sklearn.decomposition import PCA
+        from sklearn.cluster import KMeans
+
+        all_props = []
+        for i, pos in tqdm.tqdm(enumerate(self.pos_list)):
+            try:
+                nuc_img = np.array(self.image_handler.images['nuc_images'][i][0,0,::2,::2,::2])
+                nuc_mask = np.array(self.image_handler.images['nuc_masks'][i][0,0,::2,::2,::2])
+            except KeyError:
+                print("Need to segment nuclei first.")
+                return
+            props = pd.DataFrame(regionprops_table(nuc_mask, nuc_img, properties=('label', 'centroid_weighted', 'intensity_max', 'intensity_mean')))
+            props['position'] = pos
+            all_props.append(props)
+        
+        all_props = pd.concat(all_props).reset_index(drop=True)
+        #print(all_props)
+        if self.config['nuc_3d']:
+            X = all_props[['centroid_weighted-0', 'intensity_max', 'intensity_mean']].to_numpy()
+        else:
+            X = all_props[['intensity_max', 'intensity_mean']].to_numpy()
+
+        all_props['classes'] = KMeans(n_clusters=2, random_state=0, n_init="auto").fit_predict(X) + 1
+        #print(all_props)
+
+        for i, pos in tqdm.tqdm(enumerate(self.pos_list)):
+            nuc_mask = np.array(self.image_handler.images['nuc_masks'][i][0,0,::2,::2,::2])
+            props = all_props[all_props.position == pos]
+            labels = all_props.label.to_numpy()
+            classes = all_props.classes.to_numpy()
+            index = np.searchsorted(labels,nuc_mask)
+            nuc_class = classes[index].reshape(nuc_mask.shape)
+            nuc_class = rescale(nuc_class.astype(np.uint16), scale = (2, 2, 2), order = 0)
+            image_io.single_position_to_zarr(nuc_class, path = self.nuc_classes_path, name = 'nuc_class', pos_name=pos, axes=('z','y','x'), dtype = np.uint16, chunk_split=(1,1))
+        '''
+        for i, pos in tqdm.tqdm(enumerate(self.pos_list)):
+            nuc_mask = np.array(self.image_handler.images['nuc_masks'][i][0,0])
+            nuc_class = nuc_mask.copy()
+            nuc_class[nuc_class > 0] = int(default_class)
+            #nuc_class = np.clip(nuc_mask, 0, 1)
+            image_io.single_position_to_zarr(nuc_class, path = self.nuc_classes_path, name = 'nuc_class', pos_name=pos, axes=('z','y','x'), dtype = np.uint16, chunk_split=(1,1))
+
     def update_masks_after_qc(self, new_mask, original_mask, mask_name, position):
 
         try:
@@ -185,6 +268,7 @@ class NucDetector:
 
 
     def gen_nuc_rois(self):
+        #Use if images are not drift corrected, but a drift correction needs to have been calculated using Drifter.
         nuc_rois = []
         nuc_masks = self.image_handler.images['nuc_masks']
         #ch = self.config['trace_ch']
@@ -217,10 +301,10 @@ class NucDetector:
             for j, roi in nuc_props.iterrows():
                 old_pos = 'P'+str(i+1).zfill(4)
                 new_pos = 'P'+str(i+1).zfill(4)+'_'+str(j+1).zfill(4)
-                sel_dc = self.image_handler.tables['drift_correction_full_frame'].query('position == @old_pos')
+                sel_dc = self.image_handler.tables[self.config['nuc_input_name']].query('position == @old_pos')
                 ref_offset = sel_dc.query('frame == @ref_frame')
                 try:
-                    Z, Y, X = self.images[i][0,ch].shape[-3:]
+                    Z, Y, X = self.images[i][0,0].shape[-3:]
                 except AttributeError: #Images not loaded for some reason
                     Z = 200
                     Y = nuc_masks[0].shape[-2]
@@ -266,6 +350,8 @@ class NucDetector:
         self.nuc_rois.to_csv(self.image_handler.out_path+'nuc_table.csv')
 
     def gen_nuc_rois_prereg(self):
+        #Use if nuclei images are already registered to rest of images you want to extract.
+
         nuc_rois = []
         nuc_masks = self.image_handler.images['nuc_masks']
         #ch = self.config['trace_ch']

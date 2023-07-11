@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="looptrace",
-    version="0.2",
+    version="0.3",
     author="Kai Sandvold Beckwith",
     author_email="kai.beckwith@embl.de",
     description="Fitting and analysis of chromatin tracing data in Python",

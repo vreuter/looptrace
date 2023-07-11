@@ -30,7 +30,7 @@ import re
 #import plotly.express as px
 from scipy import interpolate
 from scipy.spatial.distance import cdist, squareform, pdist
-from scipy.spatial import ConvexHull
+from scipy.spatial import KDTree
 from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
 import matplotlib.pyplot as plt
 
@@ -44,10 +44,11 @@ warnings.simplefilter('ignore', category=NumbaPerformanceWarning)
 
 import seaborn as sns
 
-def gen_random_coil(g_dist, s_dist = 24.7, std_scaling = 0.5, deg=360, n_traces = 1000, sigma_noise = 2):
+def gen_random_coil(g_dist, step_size = 9.060920652238131, std_scaling = 0.5, deg=360, n_traces = 1000, sigma_noise = 2):
     traces = []
     for j in range(n_traces):
-        L = [np.random.normal(np.sqrt(d)*s_dist, np.sqrt(d)*s_dist*std_scaling, 1) for d in g_dist]  # Calculate the step lengths, drawn from normal distribution according to paramters set above.
+        #L = [np.random.normal(np.sqrt(d)*s_dist, np.sqrt(d)*s_dist*std_scaling, 1) for d in g_dist]  # Calculate the step lengths, drawn from normal distribution according to paramters set above.
+        L = [np.random.normal(step_size*d, step_size*d*std_scaling, 1) for d in g_dist]
         N = len(L)+1
         #N = 1135//step_denom #Number of steps in each random walk
         #N = np.sum(g_dist).astype(int)//step_denom + 1
@@ -60,7 +61,7 @@ def gen_random_coil(g_dist, s_dist = 24.7, std_scaling = 0.5, deg=360, n_traces 
         
         #Initialize trace arrays
         trace_id = np.ones(N) * j
-        frame = np.array(range(N))+1
+        frame = np.array(range(N))
         x = np.zeros(N)
         y = np.zeros(N)
         z = np.zeros(N)
@@ -83,7 +84,7 @@ def gen_random_coil(g_dist, s_dist = 24.7, std_scaling = 0.5, deg=360, n_traces 
     traces = pd.DataFrame(traces)#.reset_index(drop=True)
     traces.columns = ['trace_id','frame','x','y','z','QC']
     traces = traces.astype({'trace_id': int, 'frame': int, 'QC': int})
-    traces['frame_name']='H'+traces['frame'].astype(str).str.zfill(2)
+    traces['hyb']='H'+traces['frame'].astype(str).str.zfill(2)
 
     return traces
 
@@ -128,7 +129,7 @@ def tracing_qc(traces, qc_config):
 
     qc = np.ones((len(traces)), dtype=bool)
 
-    if max_dist:
+    if max_dist > 0:
         refs = df[df['frame'] == df['ref_frame']]
         for dim in ['z','y','x']:
             refs_map = dict(zip(refs['trace_id'], refs[dim]))
@@ -139,11 +140,31 @@ def tracing_qc(traces, qc_config):
     qc = qc & (df['A'] > (A_to_BG*df['BG']))
     qc = qc & (df['sigma_xy'] < sigma_xy_max)
     qc = qc & (df['sigma_z'] < sigma_z_max)
-    qc = qc & df['z_px'].between(0,100)
-    qc = qc & df['y_px'].between(0,100)
-    qc = qc & df['x_px'].between(0,100)
+    qc = qc & df['z_px'].between(0,500)
+    qc = qc & df['y_px'].between(0,500)
+    qc = qc & df['x_px'].between(0,500)
 
     return qc.astype(int)
+
+
+def rolling_distance_filter(points, window, k):
+    '''
+    Similar to a Hampel filter, calculates eucledian distances of each point to a rolling median of size window.
+    Returns a boolean array of which points have distances larger than k standard deviations from the rolling.
+    '''
+
+    n_points = len(points)
+    rolling_dists = []
+    for i in range(0,n_points):
+        if i<window:
+            rolling_dists.append(np.sqrt(np.sum((points[i,:3]-np.median(points[0:window,:3], axis=0))**2)))
+        elif (i>window) and (i<(n_points-window)):
+            rolling_dists.append(np.sqrt(np.sum((points[i,:3]-np.median(points[i-window//2:i+window//2,:3], axis=0))**2)))
+        else:
+            rolling_dists.append(np.sqrt(np.sum((points[i,:3]-np.median(points[-window:,:3], axis=0))**2)))
+    rolling_dists
+    return ~(rolling_dists>k*np.std(rolling_dists))
+
 '''
 def tracing_qc(row, qc_dict, traces_df=None):
 
@@ -314,7 +335,7 @@ def genomic_distance_map(genomic_positions):
         g_dists[str(c)] = dist
     return g_dists
 
-def pwd_calc(traces):
+def pwd_calc(traces, trace_ids = -1):
     '''
     Parameters
     ----------
@@ -325,7 +346,7 @@ def pwd_calc(traces):
     pwds : Pair-wise distance matrixes for traces as an 3D numpy array.
     '''
     
-    points = points_from_traces_nan(traces, trace_ids = -1)
+    points = points_from_traces_nan(traces, trace_ids = trace_ids)
     pwds = [cdist(p, p) for p in points]
     pwds = np.stack(pwds)
     return pwds
@@ -708,6 +729,30 @@ def cluster_similarity(traces, cluster_df, method='cluster', metric='aligned_pcc
     
     return [np.mean(res_combo), np.mean(res_single)]
 
+def fiedler_seriation(traces, n_groups = 6):
+    
+    '''
+    Fiedler-vector Seriation-based sorting/analysis of traces, based on pearson correlation between the pairwise distances (inversed to emphasize proximities) of each trace.
+    Takes traces dataframe, returns the group identity of each trace (split into n_groups) and plots a seriated similarity matrix of all the traces (downscaled for visualization purposes)
+    '''
+
+
+    from scipy.spatial.distance import pdist, squareform
+    from skimage.transform import downscale_local_mean
+    points = np.stack([pdist(t) for t in points_from_traces_nan(traces, trace_ids = -1)])
+    sim_matrix = squareform(pdist(1/points, pcc_dist))
+    u,s,v=np.linalg.svd(sim_matrix)
+    clust_ids = np.array_split(traces['trace_id'].unique()[np.argsort(u[:,1])],n_groups)
+    clust_id_map = {}
+    for i, tids in enumerate(clust_ids):
+        for tid in tids:
+            clust_id_map[tid] = i
+
+    plt.figure(figsize=(5,5))
+    plt.imshow(downscale_local_mean(squareform(pdist(1/points[np.argsort(u[:,1])], pcc_dist)), (20,20)), cmap = 'turbo_r', vmin=0.7, vmax=1)
+    plt.colorbar(fraction=0.046, pad=0.04)
+    return clust_id_map
+
 
 def run_gpa_all_clusters(traces, cluster_df, metric='dendro', min_cluster = 1):
     '''
@@ -1011,7 +1056,7 @@ def points_from_traces(traces, trace_ids=-1):
     
     if trace_ids == -1:
         trace_ids, idx = np.unique(arr[:,0], return_index=True)
-        return np.split(arr, idx[1:], axis=0)
+        return np.split(arr[:,1:], idx[1:], axis=0)
 
     elif not isinstance(trace_ids, (list, tuple)):
         trace_ids = [trace_ids]
@@ -1084,6 +1129,26 @@ def center_points_qc(a):
     qc = qc[:,np.newaxis] #Reshape QC to reappend
     return np.append(ac,qc,axis=1)
 
+def affine_transform_points(points, A):
+    ''' Adapted from: https://stackoverflow.com/questions/20546182/how-to-perform-coordinates-affine-transformation-using-python-part-2, user Hunse reply.
+        Pad the data with ones, so that our transformation can do translations too
+
+    Args:
+        points (_type_): nD point set to transform
+        A (_type_): affine matrix
+
+    Returns:
+        x_transformed: point set transformed by affine matrix
+    '''
+
+    pad = lambda x: np.hstack([x, np.ones((x.shape[0], 1))])
+    unpad = lambda x: x[:,:-1]
+    transform = lambda x: unpad(np.dot(pad(x), A))
+
+    return transform(points)
+
+def hampel_filter(points):
+    return
 
 def spline_interp(points, n_points=100):
     '''
@@ -1238,7 +1303,7 @@ def contour_length(point_set):
         dist += np.linalg.norm(point_set[i+1]-point_set[i])
     return dist
 
-def trace_metrics(traces, use_interp = False, diagonal = 0, contact_cutoff = 150, only_small_loops = False):
+def trace_metrics(traces, use_interp = False, diagonal = 0, contact_cutoff = 150, only_small_loops = False, g_dists = None):
     points_nan = points_from_traces_nan(traces)
     points_qc = points_from_traces_qc_filt(traces)
     #ind_u = np.triu_indices(points_nan[0].shape[0], k=2)
@@ -1246,7 +1311,12 @@ def trace_metrics(traces, use_interp = False, diagonal = 0, contact_cutoff = 150
     trace_ids = traces.trace_id.unique()
     metrics = []
     loop_metrics = []
+
+    if g_dists is None:
+        g_dists = np.arange(len(points_nan))
+
     for i in tqdm.tqdm(range(len(points_nan))):
+        
         if use_interp:
             point_set = np.column_stack(spline_interp([points_qc[i][:,0],points_qc[i][:,1],points_qc[i][:,2]]))
         else:
@@ -1258,6 +1328,9 @@ def trace_metrics(traces, use_interp = False, diagonal = 0, contact_cutoff = 150
         contacts = dists_diag < contact_cutoff
 
         contact_coords = np.argwhere(contacts)
+        #left_anchors = np.unique(contact_coords[:,0])
+        #right_anchors = np.unique(contact_coords[:,1])
+
         #print(contact_coords)
         stacked_loops = []
         for c in contact_coords:
@@ -1282,7 +1355,16 @@ def trace_metrics(traces, use_interp = False, diagonal = 0, contact_cutoff = 150
         rog = radius_of_gyration(points_qc[i])
         contour = contour_length(points_qc[i])
         #hull_volume = ConvexHull(points_qc[i]).volume
-        nn_dist = np.nanmean(np.diagonal(dists, 1))
+        nn_dist = np.nanmedian(np.diagonal(dists, 1))
+        nn_dist_std = np.nanstd(np.diagonal(dists, 1))
+        
+        tree = KDTree(points_qc[i])
+        radius = contact_cutoff*2
+        neighbors = tree.query_ball_tree(tree, radius)
+        knn = np.array([len(i) for i in neighbors])
+        knn_mean = np.mean(knn)
+        knn_std = np.std(knn)
+
         if len(contact_coords) == 0:
             freq_nested = np.nan
         else:
@@ -1293,7 +1375,40 @@ def trace_metrics(traces, use_interp = False, diagonal = 0, contact_cutoff = 150
         else:
             all_loops = contact_coords
         loop_contours = []
+        loop_gdists = []
+
+        prev_anchor = -1
         for j, loop_coords in enumerate(all_loops):
+            a = loop_coords[1]
+            if a != prev_anchor: #Avoids multiple counting of the same anchors. TODO: Make try except blocks more elegant, just prefilter for edges?
+                try:
+                    loop_nn_dist_m1 = dists[a-1, a]
+                except IndexError:
+                    loop_nn_dist_m1 = np.nan
+                try:
+                    loop_nn_dist_m2 = dists[a-2, a-1]
+                except IndexError:
+                    loop_nn_dist_m2 = np.nan
+                try:
+                    loop_nn_dist_m3 = dists[a-3, a-2]
+                except IndexError:
+                    loop_nn_dist_m3 = np.nan
+                try:
+                    loop_nn_dist_p1 = dists[a, a+1]
+                except IndexError:
+                    loop_nn_dist_p1 = np.nan
+                try:
+                    loop_nn_dist_p2 = dists[a+1, a+2]
+                except IndexError:
+                    loop_nn_dist_p2 = np.nan
+                try:
+                    loop_nn_dist_p3 = dists[a+2, a+3]
+                except IndexError:
+                    loop_nn_dist_p3  = np.nan
+                prev_anchor = a
+            else:
+                pass
+
             loop_points = point_set[loop_coords[0]:loop_coords[1]+1]
             loop_points = loop_points[~np.isnan(loop_points).any(axis=1), :]
             loop_contour = contour_length(loop_points)
@@ -1302,21 +1417,30 @@ def trace_metrics(traces, use_interp = False, diagonal = 0, contact_cutoff = 150
                 stacked = np.any(np.all(np.array(loop_coords) == np.array(stacked_loops), axis=(1)))
             except np.AxisError:
                 stacked = False
-            loop_metrics.append([trace_ids[i], j, loop_coords[0], loop_coords[1], loop_contour, stacked])
+            loop_gdist = g_dists[loop_coords[1]]-g_dists[loop_coords[0]]
+            loop_metrics.append([trace_ids[i], j, loop_coords[0], loop_coords[1], loop_contour, stacked, loop_gdist, 
+                                 loop_nn_dist_m1, loop_nn_dist_m2, loop_nn_dist_m3, loop_nn_dist_p1, loop_nn_dist_p2, loop_nn_dist_p3])
             loop_contours.append(loop_contour)
-        av_loop_size = np.mean(loop_contours)
+            loop_gdists.append(loop_gdist)
+        av_loop_size = np.median(loop_contours)
+        av_loop_gsize = np.median(loop_gdists)
 
         interp_point_set = np.column_stack(spline_interp([points_qc[i][:,0],points_qc[i][:,1],points_qc[i][:,2]]))
 
         interp_contour = contour_length(interp_point_set)
         interp_rog = radius_of_gyration(interp_point_set)
 
-        metrics.append([trace_ids[i], n_contacts, trace_elongation, rog, contour, av_loop_size, nn_dist, interp_contour, interp_rog, freq_nested])
-    metrics = pd.DataFrame(metrics, columns=['trace_id', 'n_contacts','elongation', 'rog', 'contour', 'av_loop_size', 'av_nn_dist', 'interp_contour', 'interp_rog', 'freq_nested'])
-    loop_metrics = pd.DataFrame(loop_metrics, columns = ['trace_id', 'loop_id', 'loop_coords_0', 'loop_coords_1','contour', 'stacked'])
+        metrics.append([trace_ids[i], n_contacts, trace_elongation, rog, contour, av_loop_size, av_loop_gsize, nn_dist, nn_dist_std, interp_contour, interp_rog, freq_nested, knn_mean, knn_std])
+    metrics = pd.DataFrame(metrics, columns=['trace_id', 'n_contacts','elongation', 'rog', 'contour', 'av_loop_size', 'av_loop_gsize', 'av_nn_dist', 'std_nn_dist', 'interp_contour', 'interp_rog', 'freq_nested', 'knn_mean', 'knn_std'])
+    loop_metrics = pd.DataFrame(loop_metrics, columns = ['trace_id', 'loop_id', 'loop_coords_0', 'loop_coords_1','contour', 'stacked', 'g_dist',
+                                                         'loop_nn_dist_m1', 'loop_nn_dist_m2', 'loop_nn_dist_m3', 'loop_nn_dist_p1', 'loop_nn_dist_p2', 'loop_nn_dist_p3'])
     loop_metrics['loop_coords_dist'] = loop_metrics['loop_coords_1']-loop_metrics['loop_coords_0']
     loop_metrics['loop_coords'] = loop_metrics['loop_coords_0'].astype(str).str.zfill(2)+'_'+loop_metrics['loop_coords_1'].astype(str).str.zfill(2)
     return metrics, loop_metrics
+
+# def filter_similar_loops(loop_list):
+#     for i in loop_list:
+        
 
 def looping_distribution_from_simulated_loops(loop_pos, loop_anchors):
     '''Calculate types of loops from simulated loop positions compared to given anchors.
@@ -1378,7 +1502,7 @@ def fit_plane_SVD(points):
     B = B / nn
     return B[0:3]
 
-def plot_heatmap(traces, trace_ids=None, ax=None, zmin=0, zmax=600, cmap = 'RdBu', crop=True, **kwargs):
+def plot_heatmap(traces, trace_ids=None, ax=None, zmin=0, zmax=600, cmap = 'RdBu', crop=True, return_std = False, **kwargs):
     '''Helper function to make heatmaps of sets of traces.
 
     Args:
@@ -1393,18 +1517,20 @@ def plot_heatmap(traces, trace_ids=None, ax=None, zmin=0, zmax=600, cmap = 'RdBu
     '''
     if trace_ids is None:
             pwds = pwd_calc(traces)
-            pwds_mean = np.nanmedian(pwds, axis=0)
     else:
         if type(trace_ids) == int:
             trace_ids = [trace_ids]
         pwds = pwd_calc(traces[traces['trace_id'].isin(trace_ids)])
-        pwds_mean = np.nanmedian(pwds, axis=0)
+    pwds_mean = np.nanmedian(pwds, axis=0)
+    pwds_std = np.nanstd(pwds, axis=0)
 
     if crop:
         nan_rows = ~np.all(np.isnan(pwds_mean), axis=0)
         nan_cols = ~np.all(np.isnan(pwds_mean), axis=1)
         pwds_mean = pwds_mean[nan_rows,:]
         pwds_mean = pwds_mean[:,nan_cols]
+        pwds_std = pwds_std[nan_rows,:]
+        pwds_std = pwds_std[:,nan_cols]
     print('Number of traces in heatmap: ', pwds.shape[0])
     ax = ax or plt.gca()
     _cmap = plt.get_cmap(cmap).copy()
@@ -1412,7 +1538,10 @@ def plot_heatmap(traces, trace_ids=None, ax=None, zmin=0, zmax=600, cmap = 'RdBu
     plot = ax.imshow(pwds_mean, vmin=zmin, vmax=zmax, cmap=_cmap, **kwargs)
     ax.axis('off')
     #fig.show()
-    return pwds_mean, plot
+    if return_std:
+        return pwds_mean, pwds_std, plot, 
+    else:
+        return pwds_mean, plot
 
 def plot_contacts(traces, trace_ids=None, cutoff=150, ax=None, zmin=0, zmax=1, cmap = 'RdBu_r', crop=True, **kwargs):
     '''Helper function to make heatmaps of sets of traces.
@@ -2286,7 +2415,69 @@ def get_continuous_color(colorscale, intermed):
         colortype="rgb")
     return [int(float(s)) for s in re.findall('\d*\.?\d+',rgb)]
 
-def animate_trace_mayavi(clust_aligned, n_points=500, duration=10, fps=10, out_dir=os.getcwd()):
+
+def animate_3d_trace_mayavi(points, duration=10, fps=20, distance = 3, focalpoint = 'auto', bgrgb=(1,1,1),save_path = None,s_ind = None):
+    from mayavi import mlab
+    import moviepy.editor as mpy
+    points = points[points[:,3]>0]
+    x = points[:,2]
+    y = points[:,1]
+    z = points[:,0]
+    xs, ys, zs = spline_interp([x, y, z])
+
+    f = mlab.figure(1, size=(1000, 1000), bgcolor=(1, 1, 1))
+    mlab.clf(f)
+    l = mlab.plot3d(xs/1000, ys/1000, zs/1000, np.arange(xs.shape[0]), tube_radius=0.010, opacity = 0.5, colormap='gnuplot2')
+    if s_ind is not None:
+        k = mlab.points3d(x/1000, y/1000, z/1000, np.arange(x.shape[0]), opacity = 1., colormap='gnuplot2', scale_mode='none', scale_factor=0.05)
+        kk = mlab.points3d(x[s_ind]/1000, y[s_ind]/1000, z[s_ind]/1000, np.arange(s_ind.shape[0]), opacity = 1, color=(0.,1.,0.), scale_mode='none', scale_factor=0.051)
+    else:
+        k = mlab.points3d(x/1000, y/1000, z/1000, np.arange(x.shape[0]), opacity = 1, colormap='gnuplot2', scale_mode='none', scale_factor=0.05)
+    # Now animate the data.
+    f.scene.background = bgrgb
+    if save_path is None:
+        mlab.show()
+    
+    else:
+        def make_frame(i):
+            mlab.view(azimuth=360*i/duration, focalpoint = focalpoint, distance=distance)
+            return mlab.screenshot(figure = f, antialiased=True)
+
+        animation = mpy.VideoClip(make_frame, duration=duration)
+        animation.write_gif(save_path, fps=fps)
+
+def animate_3d_trace_mayavi(points, duration=10, fps=20, distance = 3, focalpoint = 'auto', bgrgb=(1,1,1),save_path = None, s_ind = None):
+    from mayavi import mlab
+    import moviepy.editor as mpy
+    points = points[points[:,3]>0]
+    x = points[:,2]
+    y = points[:,1]
+    z = points[:,0]
+    xs, ys, zs = spline_interp([x, y, z])
+
+    f = mlab.figure(1, size=(1000, 1000), bgcolor=(1, 1, 1))
+    mlab.clf(f)
+    l = mlab.plot3d(xs/1000, ys/1000, zs/1000, np.arange(xs.shape[0]), tube_radius=0.010, opacity = 0.5, colormap='gnuplot2')
+    if s_ind is not None:
+        k = mlab.points3d(x/1000, y/1000, z/1000, np.arange(x.shape[0]), opacity = 1., colormap='gnuplot2', scale_mode='none', scale_factor=0.05)
+        kk = mlab.points3d(x[s_ind]/1000, y[s_ind]/1000, z[s_ind]/1000, np.arange(s_ind.shape[0]), opacity = 1, color=(0.,1.,0.), scale_mode='none', scale_factor=0.051)
+    else:
+        k = mlab.points3d(x/1000, y/1000, z/1000, np.arange(x.shape[0]), opacity = 1, colormap='gnuplot2', scale_mode='none', scale_factor=0.05)
+    # Now animate the data.
+    f.scene.background = bgrgb
+    if save_path is None:
+        mlab.show()
+    
+    else:
+        def make_frame(i):
+            mlab.view(azimuth=360*i/duration, focalpoint = focalpoint, distance=distance)
+            return mlab.screenshot(figure = f, antialiased=True)
+
+        animation = mpy.VideoClip(make_frame, duration=duration)
+        animation.write_gif(save_path, fps=fps)
+
+
+def animate_trace_dynamics_mayavi(clust_aligned, n_points=500, duration=10, fps=10, out_path=os.getcwd()+'animation.gif'):
     from mayavi import mlab
     mlab.options.offscreen = True
     import moviepy.editor as mpy
@@ -2330,11 +2521,11 @@ def animate_trace_mayavi(clust_aligned, n_points=500, duration=10, fps=10, out_d
         z_new = zs[i]/1000
         ms.trait_set(x=x_new, y=y_new, z=z_new)
         l2.set(text=str(i))
-        mlab.view(azimuth=360/(i+1), distance=2)
+        mlab.view(azimuth=360*i/duration, distance=2)
         return mlab.screenshot(antialiased=True)
 
     animation = mpy.VideoClip(make_frame, duration=duration)
-    animation.write_gif(r"M:\Kai\tests\test.gif", fps=fps)
+    animation.write_gif(out_path, fps=fps)
 
 def animate_sim_mayavi(point_array, out_path, fps=10, n_points = 100, loops = None):
     from mayavi import mlab
@@ -2377,3 +2568,48 @@ def animate_sim_mayavi(point_array, out_path, fps=10, n_points = 100, loops = No
 
     animation = mpy.VideoClip(make_frame, duration=x.shape[0]//fps)
     animation.write_gif(out_path, fps=fps)
+
+
+def trace_3d_mayavi(points = None, dist_map = None, stdev = None, sel_ind = None, duration=10, fps=20, distance = 2, focalpoint = 'auto', bgrgb=(1,1,1), save_path = None, showpoints = True):
+    from sklearn import manifold
+    from mayavi import mlab
+    if dist_map is not None:
+        mds = manifold.MDS(3, dissimilarity='precomputed')
+        coords = mds.fit_transform(dist_map)
+        coords_qc=np.ones((coords.shape[0],4))
+        coords_qc[:,:-1] = coords
+        x, y, z = coords[:,0], coords[:,1], coords[:,2]
+    elif points is not None:
+        x, y, z = points[:,0], points[:,1], points[:,2]
+
+    xs, ys, zs = spline_interp([x, y, z], n_points=len(x)*10)
+    f = mlab.figure(1, size=(1000, 1000), bgcolor=(1, 1, 1), fgcolor=(0.,0.,0.))
+    #mlab.clf(f)
+    l = mlab.plot3d(xs/1000, ys/1000, zs/1000, np.arange(xs.shape[0]), tube_radius=0.01, opacity = 1., colormap='gnuplot2')
+    if showpoints:
+        k = mlab.points3d(x/1000, y/1000, z/1000, np.arange(x.shape[0]), opacity = 1, colormap='gnuplot2', scale_mode='none', scale_factor=0.05, resolution = 50)
+    if stdev is not None:
+        m = mlab.points3d(x/1000, y/1000, z/1000, stdev/1000, opacity = 0.1, color=(0.9,0.9,0.9), scale_mode='scalar', scale_factor=1, resolution = 50)
+    if sel_ind is not None:
+        kk = mlab.points3d(x[sel_ind]/1000, y[sel_ind]/1000, z[sel_ind]/1000, np.arange(sel_ind.shape[0]), opacity = 1, color=(0.,1.,0.), scale_mode='none', scale_factor=0.035)
+    #k = mlab.points3d(x/1000, y/1000, z/1000, points_std/1000, opacity = 0.5, colormap='jet', scale_mode='scalar', scale_factor=1, resolution = 20)
+    f.scene._lift()
+    f.scene.background = bgrgb
+    f.scene.camera.parallel_scale = 50
+    f.scene.light_manager.light_mode = 'vtk'
+    f.scene.light_manager.lights[0].intensity = 0.5 
+    f.scene.light_manager.lights[1].activate = True 
+    f.scene.light_manager.lights[1].intensity = 0.5 
+    mlab.view(distance=distance)
+
+    if save_path is None:
+        mlab.show()
+    
+    else:
+        import moviepy.editor as mpy
+        def make_frame(i):
+            mlab.view(azimuth=360*i/duration, focalpoint = focalpoint, distance=distance)
+            return mlab.screenshot(figure = f, antialiased=True)
+
+        animation = mpy.VideoClip(make_frame, duration=duration)
+        animation.write_gif(save_path, fps=fps)

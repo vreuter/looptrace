@@ -24,10 +24,10 @@ if __name__ == '__main__':
     parser.add_argument('--module', help='Name of module to load', default=None)
     parser.add_argument('--env', help='Path to conda env to use')
     parser.add_argument('--bin_path', help='Path to python file to run.')
-    parser.add_argument("--config_path", help="Config file path")
-    parser.add_argument("--image_path", help="Path to folder with images to read.", default=None)
-    parser.add_argument("--image_save_path", help="(Optional): Path to folder to save images to.", default=None)
-    parser.add_argument('--additional_options', help = 'Additional options to script.', default=None)
+    #parser.add_argument("--config_path", help="Config file path")
+    #parser.add_argument("--image_path", help="Path to folder with images to read.", default=None)
+    #parser.add_argument("--image_save_path", help="(Optional): Path to folder to save images to.", default=None)
+    parser.add_argument('--options', help = 'Additional options to script.', default=None)
     parser.add_argument('--run', help='Run the cluster job in addition to making the sbatch file.', action='store_true')
     args = parser.parse_args()
 
@@ -59,16 +59,7 @@ if __name__ == '__main__':
         if args.env is not None:
             fh.writelines("source ~/miniconda3/etc/profile.d/conda.sh\n")
             fh.writelines("conda deactivate\n")
-            #fh.writelines('cosnda activate '+args.env+'\n')
-            #fh.writelines('which python3\n')
-        if args.additional_options is not None:
-            fh.writelines(' '.join(['conda run -p', args.env, 'python3', args.bin_path, args.config_path, args.image_path, args.additional_options]))
-        elif args.image_path is not None:
-            fh.writelines(' '.join(['conda run -p', args.env, 'python3', args.bin_path, args.config_path, args.image_path]))
-        else:
-            fh.writelines(' '.join(['conda run -p', args.env, 'python3', args.bin_path, args.config_path]))
-        if args.image_save_path:
-            fh.writelines(' '.join([' --image_save_path', args.image_save_path]))
-    
+        fh.writelines(' '.join(['conda run -p', args.env, 'python3', args.bin_path, ' '])+args.options)
+
     if args.run:
         subprocess.run(['sbatch', job_file])

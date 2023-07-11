@@ -1,7 +1,7 @@
 # conda env create | update -f environment_analysis.yml
 name: looptrace_analysis
 dependencies:
-    - python=3.9
+    - python
     - numba::numba
     - numba::llvmlite
     - scipy
@@ -18,4 +18,8 @@ dependencies:
         - fsspec>=0.9.0
         - scikit-learn
         - umap-learn
-        - ipyvolume
+        - mayavi
+        - binsreg
+        - nd2
+        - hampel
+        - matplotlib-scalebar

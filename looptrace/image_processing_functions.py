@@ -108,26 +108,27 @@ def update_roi_points(point_layer, roi_table, position, downscale):
     rois = rois.drop(rois[rois['position']==position].index)
     return pd.concat([rois, new_rois]).sort_values('position').reset_index(drop=True)
 
-def filter_rois_in_nucs(rois, nuc_masks, pos_list, new_col='nuc_label', nuc_drifts = None, nuc_target_frame = None, spot_drifts = None):
+def filter_rois_in_nucs(rois, nuc_label_img, new_col='nuc_label', nuc_drifts = None, nuc_target_frame = None, spot_drifts = None):
     '''Check if a spot is in inside a segmented nucleus.
 
     Args:
         rois (DataFrame): ROI table to check
-        nuc_masks (list): List of 2D nuclear mask images, where 0 is outside nuclei and >0 inside
+        nuc_label_img (list): 2D/3D label images, where 0 is outside nuclei and >0 inside
         pos_list (list): List of all the positions (str) to check
         new_col (str, optional): The name of the new column in the ROI table. Defaults to 'nuc_label'.
 
     Returns:
         rois (DataFrame): Updated ROI table indicating if ROI is inside nucleus or not.
     '''
-    print(nuc_masks[0].shape)
-    def spot_in_nuc(row, nuc_masks):
-        pos_index = pos_list.index(row['position'])
+
+    new_rois = rois.copy()
+    print(nuc_label_img.shape)
+    def spot_in_nuc(row, nuc_label_img):
         try:
-            if nuc_masks[0].shape[0] == 1:
-                spot_label = int(nuc_masks[pos_index][0, int(row['yc']), int(row['xc'])])
+            if nuc_label_img.shape[-3] == 1:
+                spot_label = int(nuc_label_img[0, int(row['yc']), int(row['xc'])])
             else:
-                spot_label = int(nuc_masks[pos_index][int(row['zc']),int(row['yc']), int(row['xc'])])
+                spot_label = int(nuc_label_img[int(row['zc']),int(row['yc']), int(row['xc'])])
         except IndexError as e: #If due to drift spot is outside frame.
             spot_label = 0
             print(e)
@@ -135,12 +136,12 @@ def filter_rois_in_nucs(rois, nuc_masks, pos_list, new_col='nuc_label', nuc_drif
         return spot_label
 
     try:
-        rois.drop(columns=[new_col], inplace=True)
+        new_rois.drop(columns=[new_col], inplace=True)
     except KeyError:
         pass
-
+    #print(rois, nuc_drifts)
     if nuc_drifts is not None:
-        rois_shifted = rois.copy()
+        rois_shifted = new_rois.copy()
         shifts = []
         for i, row in rois_shifted.iterrows():
             drift_target = nuc_drifts[(nuc_drifts['position'] == row['position']) & (nuc_drifts['frame'] == nuc_target_frame)][['z_px_course', 'y_px_course', 'x_px_course']].to_numpy()
@@ -150,17 +151,20 @@ def filter_rois_in_nucs(rois, nuc_masks, pos_list, new_col='nuc_label', nuc_drif
         shifts = pd.DataFrame(shifts, columns=['z','y','x'])
         rois_shifted[['zc', 'yc', 'xc']] = rois_shifted[['zc', 'yc', 'xc']].to_numpy() - shifts[['z','y','x']].to_numpy()
 
-        rois[new_col] = rois_shifted.apply(spot_in_nuc, nuc_masks=nuc_masks, axis=1)
+        new_rois.loc[:,new_col] = rois_shifted.apply(spot_in_nuc, nuc_label_img=nuc_label_img, axis=1)
     
     else:
-        rois[new_col] = rois.apply(spot_in_nuc, nuc_masks=nuc_masks, axis=1)
+        new_rois.loc[:,new_col] = new_rois.apply(spot_in_nuc, nuc_label_img=nuc_label_img, axis=1)
 
-    return rois
+    return new_rois
 
-def subtract_crosstalk(source, bleed, threshold=0):
-    mask = source > threshold
-    ratio=np.average(bleed[mask]/source[mask])
-    out = np.clip(bleed - (ratio * source), a_min=0, a_max=None)
+def subtract_crosstalk(source, bleed, threshold=500):
+    shift = drift_corr_course(source, bleed, downsample=1)
+    bleed = ndi.shift(bleed, shift=shift, order=1)
+    mask = bleed > threshold
+    ratio = np.average(source[mask]/bleed[mask])
+    print(ratio)
+    out = np.clip(source - (ratio * bleed), a_min=0, a_max=None)
     return out, bleed
     
 def pad_to_shape(arr, shape, mode='constant'):
@@ -245,7 +249,7 @@ def center_crop_embryo(embryo_stack, size, center=None):
         out = pad_to_shape(out, size)
     return out
 
-def detect_spots(input_img, spot_threshold=20, min_dist=None):
+def detect_spots(input_img, spot_threshold=20, expand_px = 10):
     '''Spot detection by difference of gaussian filter
     #TODO: Do not use hard-coded sigma values
 
@@ -262,12 +266,12 @@ def detect_spots(input_img, spot_threshold=20, min_dist=None):
     img = img/gaussian(input_img, 3)
     img = (img-np.mean(img))/np.std(img)
     labels, num_spots = ndi.label(img>spot_threshold)
-    labels = expand_labels(labels, 10)
+    labels = expand_labels(labels, expand_px)
     
     #Make a DataFrame with the ROI info
     spot_props=pd.DataFrame(regionprops_table(label_image = labels, 
                                         intensity_image = input_img,
-                                        properties=('label','centroid_weighted')))
+                                        properties=('label','centroid_weighted', 'intensity_mean')))
     
     spot_props.drop(['label'], axis=1, inplace=True)
     spot_props.rename(columns={'centroid_weighted-0': 'zc',
@@ -275,11 +279,8 @@ def detect_spots(input_img, spot_threshold=20, min_dist=None):
                                         'centroid_weighted-2': 'xc'},
                         inplace = True)
 
-    if min_dist:
-        dists = squareform(pdist(spot_props[['zc', 'yc', 'xc']].to_numpy(), metric='euclidean'))
-        idx = np.nonzero(np.triu(dists < min_dist, k=1))[1]
-        spot_props = spot_props.drop(idx)
-        spot_props = spot_props.reset_index(drop=True)
+
+    spot_props = spot_props.reset_index(drop=True)
 
     spot_props.rename(columns={'index':'roi_id'},
                                 inplace = True)
@@ -287,9 +288,8 @@ def detect_spots(input_img, spot_threshold=20, min_dist=None):
     #print(f'Found {len(spot_props)} spots.', end = ' ')
     return spot_props, img
 
-def detect_spots_int(input_img, spot_threshold=500, expand_px = 1, min_dist=None):
-    '''Spot detection by difference of gaussian filter
-    #TODO: Do not use hard-coded sigma values
+def detect_spots_int(input_img, spot_threshold=500, expand_px = 1):
+    '''Spot detection by difference simple intensity threshold
 
     Args:
         img (ndarray): Input 3D image
@@ -300,17 +300,19 @@ def detect_spots_int(input_img, spot_threshold=500, expand_px = 1, min_dist=None
         img (ndarray): The DoG filtered image used for spot detection.
     '''
     #img = white_tophat(image=input_img, footprint=ball(2))
+    binary = input_img > spot_threshold
+    binary = ndi.binary_fill_holes(binary)
     struct = ndi.generate_binary_structure(input_img.ndim, 2)
-    labels, n_obj = ndi.label(input_img > spot_threshold, structure=struct)
+    labels, n_obj = ndi.label(binary, structure=struct)
     if n_obj > 1: #Do not need this with area filtering below.
         #pass
         labels = remove_small_objects(labels, min_size=5)
     if expand_px > 0:
         labels = expand_labels(labels, expand_px)
     if np.all(labels == 0): #If there are no labels anymore:
-        return pd.DataFrame(columns=['label', 'z_min','y_min','x_min','z_max','y_max','x_max','area','zc','yc','xc']), labels
+        return pd.DataFrame(columns=['label', 'z_min','y_min','x_min','z_max','y_max','x_max','area','zc','yc','xc', 'intensity_mean']), labels
     else:
-        spot_props = regionprops_table(labels, input_img, properties=('label', 'bbox', 'area', 'centroid_weighted'))
+        spot_props = regionprops_table(labels, input_img, properties=('label', 'bbox', 'area', 'centroid_weighted', 'intensity_mean'))
         spot_props = pd.DataFrame(spot_props)
         #spot_props = spot_props.query('area > 10')
 
@@ -324,10 +326,50 @@ def detect_spots_int(input_img, spot_threshold=500, expand_px = 1, min_dist=None
                                             'bbox-4': 'y_max',
                                             'bbox-5': 'x_max'})
         
-        if min_dist:
-            dists = squareform(pdist(spot_props[['zc', 'yc', 'xc']].to_numpy(), metric='euclidean'))
-            idx = np.nonzero(np.triu(dists < min_dist, k=1))[1]
-            spot_props = spot_props.drop(idx)
+        spot_props = spot_props.reset_index(drop=True)
+        spot_props = spot_props.rename(columns={'index':'roi_id'})
+
+        #print(f'Found {len(spot_props)} spots.', end=' ')
+        return spot_props, labels
+    
+def detect_spots_sbr(input_img, spot_threshold=2, expand_px = 1):
+    '''Spot detection by signal-to-background filtering (background here defined as image median)
+
+    Args:
+        img (ndarray): Input 3D image
+        spot_threshold (int): Threshold to use for spots. Defaults to 500.
+
+    Returns:
+        spot_props (DataFrame): The centroids and roi_IDs of the spots found. 
+        img (ndarray): The DoG filtered image used for spot detection.
+    '''
+    #img = white_tophat(image=input_img, footprint=ball(2))
+    img_median = np.median(input_img)
+    binary = (input_img-img_median) > (spot_threshold * img_median)
+    binary = ndi.binary_fill_holes(binary)
+    struct = ndi.generate_binary_structure(input_img.ndim, 2)
+    labels, n_obj = ndi.label(binary, structure=struct)
+    if n_obj > 1: #Do not need this with area filtering below.
+        #pass
+        labels = remove_small_objects(labels, min_size=5)
+    if expand_px > 0:
+        labels = expand_labels(labels, expand_px)
+    if np.all(labels == 0): #If there are no labels anymore:
+        return pd.DataFrame(columns=['label', 'z_min','y_min','x_min','z_max','y_max','x_max','area','zc','yc','xc', 'intensity_mean']), labels
+    else:
+        spot_props = regionprops_table(labels, input_img, properties=('label', 'bbox', 'area', 'centroid_weighted', 'intensity_mean'))
+        spot_props = pd.DataFrame(spot_props)
+        #spot_props = spot_props.query('area > 10')
+
+        spot_props = spot_props.rename(columns={'centroid_weighted-0': 'zc',
+                                            'centroid_weighted-1': 'yc',
+                                            'centroid_weighted-2': 'xc',
+                                            'bbox-0': 'z_min',
+                                            'bbox-1': 'y_min',
+                                            'bbox-2': 'x_min',
+                                            'bbox-3': 'z_max',
+                                            'bbox-4': 'y_max',
+                                            'bbox-5': 'x_max'})
         
         spot_props = spot_props.reset_index(drop=True)
         spot_props = spot_props.rename(columns={'index':'roi_id'})
@@ -336,15 +378,43 @@ def detect_spots_int(input_img, spot_threshold=500, expand_px = 1, min_dist=None
         return spot_props, labels
 
 def roi_center_to_bbox(rois, roi_size):
-    rois['z_min'] = rois['zc'] - roi_size[0]//2
-    rois['z_max'] = rois['zc'] + roi_size[0]//2
-    rois['y_min'] = rois['yc'] - roi_size[1]//2
-    rois['y_max'] = rois['yc'] + roi_size[1]//2
-    rois['x_min'] = rois['xc'] - roi_size[2]//2
-    rois['x_max'] = rois['xc'] + roi_size[2]//2
+    if isinstance(roi_size, int):
+        roi_size = [roi_size]*3
+    rois['z_min'] = (rois['zc'] - roi_size[0]//2).astype(int)
+    rois['z_max'] = (rois['zc'] + roi_size[0]//2).astype(int)
+    rois['y_min'] = (rois['yc'] - roi_size[1]//2).astype(int)
+    rois['y_max'] = (rois['yc'] + roi_size[1]//2).astype(int)
+    rois['x_min'] = (rois['xc'] - roi_size[2]//2).astype(int)
+    rois['x_max'] = (rois['xc'] + roi_size[2]//2).astype(int)
     return rois
 
-def generate_bead_rois(t_img, threshold, min_bead_int, bead_roi_px=16, n_points=200):
+
+def get_indexes_of_nearby_rois(rois, min_dist = 0, weights = None):
+    '''Take an array of rois and calculates which rois are closer than min_dist, and returns the indexes of the rois to remove (either the dimmest if weights is an iterable, or the last if weights is None)
+
+    Args:
+        rois (np.ndarray or list): NxM array of roi coordinates 
+        min_dist (float or int, optional): minimum distance eucledian distance in roi coordinates
+        weights (np.ndarray or list, optional): 1D array/list of weights (e.g. intensities) used to compare which of the proximal rois to keep. The lowest weight will be listed for removal.
+    Returns:
+        remove_idx (np.ndarray): 1D array of the indexes of the rois to remove.
+    '''
+
+    dists = squareform(pdist(rois, metric='euclidean'))
+    idx = np.argwhere(np.triu(dists < min_dist, k=1))
+    
+    if weights is not None: #Remove the proximal roi with the lowest weight
+        remove_idx = []
+        for i in idx:
+            remove_idx.append(i[np.argmin(weights[i])])
+    else:
+        #If no weights, just remove the last of the proximal rois.
+        remove_idx = idx[:,1]
+
+    remove_idx = np.unique(remove_idx)
+    return remove_idx
+
+def generate_bead_rois(t_img, threshold, min_bead_int, bead_roi_px=16, n_points=200, max_size = 500):
     '''Function for finding positions of beads in an image based on manually set thresholds in config file.
 
     Args:
@@ -359,11 +429,13 @@ def generate_bead_rois(t_img, threshold, min_bead_int, bead_roi_px=16, n_points=
     roi_px = bead_roi_px//2
     t_img_label,num_labels=ndi.label(t_img>threshold)
     print('Number of unfiltered beads found: ', num_labels)
-    t_img_maxima = pd.DataFrame(regionprops_table(t_img_label, t_img, properties=('label', 'centroid', 'max_intensity')))
+    t_img_maxima = pd.DataFrame(regionprops_table(t_img_label, t_img, properties=('label', 'centroid', 'max_intensity', 'area')))
     
-    t_img_maxima = t_img_maxima[(t_img_maxima['centroid-0'] > roi_px) & (t_img_maxima['centroid-1'] > roi_px) & (t_img_maxima['centroid-2'] > roi_px)].query('max_intensity > @min_bead_int')
+    t_img_maxima = t_img_maxima[(t_img_maxima['centroid-0'] > roi_px) & (t_img_maxima['centroid-1'] > roi_px) & (t_img_maxima['centroid-2'] > roi_px) & (t_img_maxima['area'] < max_size)].query('max_intensity > @min_bead_int')
     
-    if len(t_img_maxima) > n_points:
+    if n_points == -1:
+        t_img_maxima = t_img_maxima[['centroid-0', 'centroid-1', 'centroid-2']].to_numpy()
+    elif len(t_img_maxima) > n_points:
         t_img_maxima = t_img_maxima.sample(n=n_points, random_state=1)[['centroid-0', 'centroid-1', 'centroid-2']].to_numpy()
     else:
         t_img_maxima = t_img_maxima.sample(n=len(t_img_maxima), random_state=1)[['centroid-0', 'centroid-1', 'centroid-2']].to_numpy()
@@ -374,13 +446,13 @@ def generate_bead_rois(t_img, threshold, min_bead_int, bead_roi_px=16, n_points=
 
 def extract_single_bead(point, img, bead_roi_px=16, drift_course=None):
     #Exctract a cropped region of a single fiducial in an image, optionally including a pre-calucalated course drift to shift the cropped region.
-    roi_px = bead_roi_px//2
+    roi_px = int(bead_roi_px//2)
     if drift_course is not None:
         s = tuple([slice(ind-int(shift)-roi_px, ind-int(shift)+roi_px) for (ind, shift) in zip(point, drift_course)])
     else:
         s = tuple([slice(ind-roi_px, ind+roi_px) for ind in point])
-    bead = img[s]
-
+    bead = np.array(img[s])
+    #print(bead.shape)
     if bead.shape != (2*roi_px, 2*roi_px, 2*roi_px):
         return np.zeros((2*roi_px, 2*roi_px, 2*roi_px))
     else:
@@ -395,7 +467,6 @@ def drift_corr_course(t_img, o_img, downsample=1):
     ----------
     t_path : Path to template image in svih5 format.
     o_path : Path to offset image in svih5 format.
-    ch : Which channel to use for drift correction.
 
     Returns
     -------
@@ -409,6 +480,24 @@ def drift_corr_course(t_img, o_img, downsample=1):
     #o_img=ndi.shift(o_img,course_drift,order=0)
     #print('Course drift:', course_drift)
     return course_drift
+
+def drift_corr_icp(t_img, o_img, threshold, min_bead_int, downsample = 1):
+    from simpleicp import PointCloud, SimpleICP
+
+    s = tuple(slice(None, None, downsample) for i in t_img.shape)
+    points_template = generate_bead_rois(np.array(t_img[s]), threshold = threshold, min_bead_int = min_bead_int, n_points = 0)
+    points_moving = generate_bead_rois(np.array(o_img[s]), threshold = threshold, min_bead_int = min_bead_int, n_points = 0)
+
+    #print(points_template, points_moving)
+    # Create point cloud objects
+    pc_fix = PointCloud(points_template, columns=["x", "y", "z"])
+    pc_mov = PointCloud(points_moving, columns=["x", "y", "z"])
+
+    # Create simpleICP object, add point clouds, and run algorithm!
+    icp = SimpleICP()
+    icp.add_point_clouds(pc_fix, pc_mov)
+    H, X_mov_transformed, rigid_body_transformation_params = icp.run(max_overlap_distance=200)
+    return np.round(H[:-1,-1] * downsample).astype(int)
 
 def drift_corr_multipoint_cc(t_img, o_img, course_drift, threshold, min_bead_int, n_points=50, upsampling=100):
     '''
@@ -473,6 +562,28 @@ def drift_corr_multipoint_cc(t_img, o_img, course_drift, threshold, min_bead_int
     #Return the 60% central mean to avoid outliers.
     return fine_drift#, np.std(shifts, axis=0)
 
+def least_squares_transform(template, moving):
+
+    #From: https://stackoverflow.com/questions/20546182/how-to-perform-coordinates-affine-transformation-using-python-part-2, user Hunse reply.
+    
+    # Pad the data with ones, so that our transformation can do translations too
+    pad = lambda x: np.hstack([x, np.ones((x.shape[0], 1))])
+    unpad = lambda x: x[:,:-1]
+    X = pad(moving)
+    Y = pad(template)
+    # Solve the least squares problem X * A = Y
+    # to find our transformation matrix A
+    A, res, rank, s = np.linalg.lstsq(X, Y, rcond=None)
+
+    transform = lambda x: unpad(np.dot(pad(x), A))
+
+    print("Error:")
+    print(template-moving)
+    print(template - transform(moving))
+    print("Max error:", np.abs(template - transform(moving)).max())
+
+    return A
+
 def napari_view(img, points=None, downscale=2, axes = 'PTCZYX', point_frame_size = 1, name=None, contrast_limits=(100,10000)):
     import napari
     try:
@@ -520,7 +631,7 @@ def decon_RL_setup(size_x=8, size_y=8, size_z=8, pz=0., wavelength=.660,
     from flowdec import data as fd_data
     from flowdec import restoration as fd_restoration
     from flowdec import psf as fd_psf
-    algo = fd_restoration.RichardsonLucyDeconvolver(3).initialize()
+    algo = fd_restoration.RichardsonLucyDeconvolver(3, pad_mode='2357', pad_min=(8,8,8)).initialize()
     kernel = fd_psf.GibsonLanni(
             size_x=size_x, size_y=size_y, size_z=size_z, pz=pz, wavelength=wavelength,
             na=na, res_lateral=res_lateral, res_axial=res_axial

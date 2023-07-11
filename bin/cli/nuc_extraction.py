@@ -18,7 +18,11 @@ if __name__ == '__main__':
     parser.add_argument("image_path", help="Path to folder with images to read.")
     parser.add_argument("--image_save_path", help="(Optional): Path to folder to save images to.", default=None)
     args = parser.parse_args()
-    H = ImageHandler(config_path=args.config_path, image_path=args.image_path, image_save_path=args.image_save_path)
+    try:
+        array_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
+    except KeyError:
+        array_id = None
+    H = ImageHandler(config_path=args.config_path, image_path=args.image_path, image_save_path=args.image_save_path, pos_id = array_id)
     N = NucDetector(H)
     if 'nuc_rois' not in H.tables:
         N.gen_nuc_rois_prereg()

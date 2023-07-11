@@ -13,9 +13,9 @@ import argparse
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run spot detection on all frames and channels listed in config.')
-    parser.add_argument("config_path", help="Config file path")
-    parser.add_argument("image_path", help="Path to folder with images to read.")
-    parser.add_argument("trace_id", help="Trace_id to visualize.", default=0)
+    parser.add_argument("--config_path", help="Config file path")
+    parser.add_argument("--image_path", help="Path to folder with images to read.")
+    parser.add_argument("--trace_id", help="Trace_id to visualize.", default=0)
     args = parser.parse_args()
     H = ImageHandler(config_path=args.config_path, image_path=args.image_path)
         

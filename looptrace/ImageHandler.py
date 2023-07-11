@@ -14,7 +14,7 @@ import numpy as np
 
 
 class ImageHandler:
-    def __init__(self, config_path, image_path = None, image_save_path = None):
+    def __init__(self, config_path, image_path = None, image_save_path = None, pos_id = None):
         '''
         Initialize ImageHandler class with config read in from YAML file.
         See config file for details on parameters.
@@ -25,16 +25,20 @@ class ImageHandler:
         self.reload_config()
 
         self.image_path = image_path
-
+        self.pos_id = pos_id
+        
         if self.image_path is not None:
-            self.read_images()
+            self.read_images(pos_id = pos_id)
 
         if image_save_path is not None:
             self.image_save_path = image_save_path
         else:
             self.image_save_path = self.image_path
         
-        self.out_path = self.config['analysis_path']+os.sep+self.config['analysis_prefix']
+        try:
+            self.out_path = self.config['analysis_path']+os.sep+self.config['analysis_prefix']
+        except KeyError:
+            self.out_path = os.path.dirname(self.config_path)+os.sep+self.config['analysis_prefix']
 
         self.load_tables()
 
@@ -44,21 +48,22 @@ class ImageHandler:
     def load_tables(self):
         self.tables = {}
         self.table_paths = {}
-        for f in os.scandir(self.config['analysis_path']):
-            if f.name.endswith('.csv') and not f.name.startswith('_'):
-                table_name = os.path.splitext(f.name)[0].split(self.config['analysis_prefix'])[1]
-                print('Loading table ', table_name)
-                table = pd.read_csv(f.path, index_col = 0)
-                self.tables[table_name] = table
-                self.table_paths[table_name] = f.path
-            elif f.name.endswith('.pkl') and not f.name.startswith('_'):
-                table_name = os.path.splitext(f.name)[0].split(self.config['analysis_prefix'])[1]
-                print('Loading table ', table_name)
-                table = pd.read_pickle(f.path)
-                self.tables[table_name] = table
-                self.table_paths[table_name] = f.path
+        for f in os.scandir(os.path.dirname(self.out_path)):
+            if f.is_file() and not (f.name.startswith('_') or f.name.startswith('.')):
+                if f.name.endswith('.csv'):
+                    table_name = os.path.splitext(f.name)[0].split(self.config['analysis_prefix'])[1]
+                    print('Loading table ', table_name)
+                    table = pd.read_csv(f.path, index_col = 0)
+                    self.tables[table_name] = table
+                    self.table_paths[table_name] = f.path
+                elif f.name.endswith('.pkl'):
+                    table_name = os.path.splitext(f.name)[0].split(self.config['analysis_prefix'])[1]
+                    print('Loading table ', table_name)
+                    table = pd.read_pickle(f.path)
+                    self.tables[table_name] = table
+                    self.table_paths[table_name] = f.path
 
-    def read_images(self):
+    def read_images(self, pos_id = None):
         '''
         Function to load existing images from the input folder, and them into a dictionary (self.images{}),
         with folder name or image name (without extensions) as keys, images as values.
@@ -79,13 +84,13 @@ class ImageHandler:
                         sample_file = os.listdir(image_path)[0]
                         print(image_path)
                         if sample_file.endswith('.nd2'):
-                            self.images[image_name], self.image_lists[image_name] = image_io.stack_nd2_to_dask(image_path)
+                            self.images[image_name], self.image_lists[image_name], self.image_metadata = image_io.stack_nd2_to_dask(image_path, position_id = pos_id)
                             print('Loaded images: ', image_name)
                         elif sample_file.endswith('.tiff') or sample_file.endswith('.tif'):
-                            self.images[image_name], self.image_lists[image_name] = image_io.stack_tif_to_dask(image_path)
+                            self.images[image_name], self.image_lists[image_name] = image_io.stack_tif_to_dask(image_path, position_id = pos_id)
                             print('Loaded images: ', image_name)
                         else:
-                            self.images[image_name], self.image_lists[image_name] = image_io.multi_ome_zarr_to_dask(image_path, remove_unused_dims = False)
+                            self.images[image_name], self.image_lists[image_name] = image_io.multi_ome_zarr_to_dask(image_path, position_id = pos_id)
                             print('Loaded images: ', image_name)
 
                 elif image_name.endswith('.npz'):

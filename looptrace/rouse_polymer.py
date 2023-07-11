@@ -103,7 +103,8 @@ spec_smc = [
             ('bound_lifetime', types.int_),
             ('unbound_lifetime', types.int_),
             ('CTCF_bound_lifetime', types.int_),
-            ('loop_lifetime', types.int_),
+            ('SMC_crash_lifetime', types.int_),
+            ('loop_lifetime', types.int_), #Not used in this simulation.
             ('ext_rate', types.float64),
             ('bound', types.boolean),
             #('age', types.int_),
@@ -123,12 +124,13 @@ spec_smc = [
             
 @jitclass(spec_smc)
 class SMC():
-    def __init__(self, N_beads: int, bound_lifetime: int, unbound_lifetime: int, CTCF_bound_lifetime: int, extrusion_rate: float, loop_lifetime: int, smc_id: int = 0):
+    def __init__(self, N_beads: int, bound_lifetime: int, unbound_lifetime: int, CTCF_bound_lifetime: int, SMC_crash_lifetime: int, extrusion_rate: float, loop_lifetime: int, smc_id: int = 0):
         self.ext_rate = extrusion_rate#int(np.round(1/extrusion_rate)) #ext_rate must be one (kb/s) or lower in this setup, gives interval between simulation steps that walk steps are made.
         self.N_beads = N_beads #The length of the simulated polymer.
         self.bound_lifetime = bound_lifetime
         self.unbound_lifetime = unbound_lifetime
         self.CTCF_bound_lifetime = CTCF_bound_lifetime
+        self.SMC_crash_lifetime = SMC_crash_lifetime
         self.loop_lifetime = loop_lifetime
         self.smc_id = smc_id
         self.unbind() #Initialize in unbound state.
@@ -153,6 +155,10 @@ class SMC():
             if self.draw_random() < 1/self.current_lifetime:
                 self.unbind()
             else:
+                if self.SMC_bound_l or self.SMC_bound_r:
+                    if self.draw_random() < 1/self.SMC_crash_lifetime:
+                        self.SMC_bound_l = False
+                        self.SMC_bound_r = False
                 self.walk()
 
 
@@ -199,12 +205,12 @@ class SMC():
     
     def walk(self):
         
-        if not (self.CTCF_bound_l or self.SMC_bound_l):
-            if self.draw_random() < self.ext_rate: #Only step if not CTCF/SMC bound on this side.
+        if not (self.CTCF_bound_l or self.SMC_bound_l):  #Only step if not CTCF/SMC bound on this side.
+            if self.draw_random() < self.ext_rate: #Note: extrusion rate cannot be higher than 1 position per timestep in this setup, would need to add this if needed.
                 self.l_pos -= 1
             
-        if not (self.CTCF_bound_r or self.SMC_bound_r):
-            if self.draw_random() < self.ext_rate: #Only step if not CTCF/SMC bound on this side. 
+        if not (self.CTCF_bound_r or self.SMC_bound_r):  #Only step if not CTCF/SMC bound on this side. 
+            if self.draw_random() < self.ext_rate:
                 self.r_pos += 1
 
         # if not self.CTCF_bound_r and self.CTCF_bound_l and (self.draw_random() < 1/self.loop_lifetime): #Loop release without unbinding
@@ -236,6 +242,7 @@ def init_SMC_sim(params):
                             bound_lifetime=params['SMC_bound_lifetime'][SMC_type],
                             unbound_lifetime=params['SMC_unbound_lifetime'][SMC_type],
                             CTCF_bound_lifetime=params['SMC_CTCF_bound_lifetime'][SMC_type],
+                            SMC_crash_lifetime=params['SMC_crash_lifetime'][SMC_type],
                             loop_lifetime=params['loop_lifetime'][SMC_type],
                             extrusion_rate=params['extrusion_rate'][SMC_type],
                             smc_id = i))
@@ -340,6 +347,7 @@ def gen_random_steps(steps, step_size, N=None, start_pos = None, cumulative=True
 
 @njit
 def gen_rouse_drift(steps, force_dict):
+    # Combined spring movement and Browinian motion according to size of Brownian steps array.
     old_pos = steps[0]
     T = steps.shape[0]
     for i in range(T-1):
@@ -353,11 +361,11 @@ def apply_forces(pos, force_dict):
     for i in prange(pos.shape[0]):
         for k, v in force_dict[i].items():
             r = pos[i]-pos[k]
-            r_euc = np.sqrt(np.sum(r**2))
-            if r_euc < 0.025:
-                forces[i]+= (0.025-r_euc) * r/r_euc
-            else:
-                forces[i]+= -v*r
+            #r_euc = np.sqrt(np.sum(r**2))
+            #if r_euc < 0.025:
+            #    forces[i]+= (0.025-r_euc) * r/r_euc
+            #else:
+            forces[i]+= -v*r
     #print(forces)
     return pos + forces
 

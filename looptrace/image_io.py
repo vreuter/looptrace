@@ -86,7 +86,7 @@ def load_config(config_file):
             print(exc)
     return config
 
-def multi_ome_zarr_to_dask(folder: str, remove_unused_dims = True):
+def multi_ome_zarr_to_dask(folder: str, position_id: int = None):
     '''The multi_ome_zarr_to_dask function takes a folder path and returns a list of dask arrays and a list of image folders by reading multiple dask images in a single folder.
         If the remove_unused_dims flag is set to True, the function will also remove unnecessary dimensions from the dask array.
 
@@ -99,17 +99,19 @@ def multi_ome_zarr_to_dask(folder: str, remove_unused_dims = True):
         list: list of strings of image folder names
     '''
     image_folders = sorted([p.name for p in os.scandir(folder) if (os.path.isdir(p) and not p.name.startswith('_'))])
+    if position_id is not None:
+        try:
+            image_folders = [image_folders[position_id]]
+        except IndexError:
+            pass
     out = []
     for image in image_folders:
-        z = zarr.open(folder+os.sep+image+os.sep+'0')
-        arr = da.from_zarr(z)
-
-        # Remove unecessary dimensions: #TODO consider if this is wise!
-        if remove_unused_dims:
-            new_slice = tuple([0 if i == 1 else slice(None) for i in arr.shape])
-            arr = arr[new_slice]
-        #chunks = (1,1,s[-3], s[-2], s[-1])
-        out.append(arr)#, chunks=chunks))
+        try:
+            z = zarr.open(folder+os.sep+image+os.sep+'0')
+            arr = da.from_zarr(z)
+            out.append(arr)#, chunks=chunks))
+        except zarr.errors.ArrayNotFoundError:
+            return [], []
     #out = da.stack(out) #Removed as not compatible with different shaped
     print('Loaded list of ', len(out), 'arrays.')
     return out, image_folders
@@ -141,22 +143,42 @@ def multipos_nd2_to_dask(folder: str):
 def stack_nd2_to_dask(folder: str, position_id: int = None):
     '''The function takes a folder path and returns a list of dask arrays and a 
     list of image folders by reading multiple nd2 images where each represents a 3D stack (split by position and time) in a single folder.
-
+    Extracts some useful metadata from the first file in the folder.
     Args:
         folder (str): Input folder path
 
     Returns:
         list: list of dask arrays of the images
+        list: names of positions
+        dict: metadata dictionary
     '''
 
     import nd2
     image_files = sorted([p.path for p in os.scandir(folder) if (p.name.endswith('.nd2') and not p.name.startswith('_'))])
     image_times = sorted(list(set([re.findall('.+(Time\d+)', s)[0] for s in image_files])))
     image_points = sorted(list(set([re.findall('.+(Point\d+)', s)[0] for s in image_files])))
+    pos_names = ["P"+str(i+1).zfill(4) for i in range(len(image_points))]
+
+    sample = nd2.ND2File(image_files[0])
+    metadata = {}
+    metadata['voxel_size'] = [sample.voxel_size().z, sample.voxel_size().y, sample.voxel_size().x]
+    metadata['microscope'] = {
+                'objectiveMagnification': sample.metadata.channels[0].microscope.objectiveMagnification,
+                'objectiveName': sample.metadata.channels[0].microscope.objectiveMagnification,
+                'objectiveNumericalAperture':sample.metadata.channels[0].microscope.objectiveNumericalAperture,
+                'zoomMagnification': sample.metadata.channels[0].microscope.zoomMagnification,
+                'immersionRefractiveIndex': sample.metadata.channels[0].microscope.immersionRefractiveIndex,
+                'modalityFlags': sample.metadata.channels[0].microscope.modalityFlags}
+    for channel in sample.metadata.channels:
+        metadata['channel_'+str(channel.channel.index)] = {'name': channel.channel.name,
+                                'emissionLambdaNm': channel.channel.emissionLambdaNm,
+                                'excitationLambdaNm': channel.channel.excitationLambdaNm}
+
     #print(image_folders)
     pos_stack = []
     if position_id is not None:
         image_points = [image_points[position_id]]
+        pos_names = [pos_names[position_id]]
     for p in tqdm.tqdm(image_points):
         t_stack = []
         for t in image_times:
@@ -172,8 +194,8 @@ def stack_nd2_to_dask(folder: str, position_id: int = None):
     out = da.stack(pos_stack)
     out = da.moveaxis(out, 2, 3)
     print('Loaded nd2 arrays of shape ', out.shape)
-    pos_names = ["P"+str(i+1).zfill(4) for i in range(out.shape[0])]
-    return out, pos_names
+    
+    return out, pos_names, metadata
 
 def stack_tif_to_dask(folder: str):
     '''The function takes a folder path and returns a list of dask arrays and a 
@@ -193,6 +215,8 @@ def stack_tif_to_dask(folder: str):
     except IndexError:
         time_dim = False
     image_points = sorted(list(set([re.findall('.+(Point\d+)', s)[0] for s in image_files])))
+    if position_id is not None:
+        image_points = [image_points[position_id]]
     #print(image_folders)
     out = []
     for p in tqdm.tqdm(image_points):
@@ -266,7 +290,10 @@ def single_position_to_zarr(images: np.ndarray or list,
         '''
         z[idx] = img
     
-    store = zarr.DirectoryStore(path+os.sep+pos_name+'.zarr')
+    if pos_name.endswith('.zarr'):
+        store = zarr.NestedDirectoryStore(path+os.sep+pos_name)
+    else:
+        store = zarr.NestedDirectoryStore(path+os.sep+pos_name+'.zarr')
     root = zarr.group(store=store, overwrite=True)
 
     size = {}
@@ -288,10 +315,17 @@ def single_position_to_zarr(images: np.ndarray or list,
     chunks = tuple([chunk_dict[ax] for ax in default_axes])
     images = np.reshape(images, shape)
 
-    root.attrs['multiscale'] = {'multiscales': [{'version': '0.3', 
-                                                    'name': name+'_'+pos_name, 
-                                                    'datasets': [{'path': '0'}],
-                                                    'axes': ['t','c','z','y','x']}]}
+    root.attrs['multiscales'] = [{'version': '0.4', 
+                                    'name': name+'_'+pos_name, 
+                                    'datasets': [{'path': '0',                     
+                                                    "coordinateTransformations": [{"type": "scale",
+                                                                                    "scale": [1.0, 1.0, 1.0, 1.0, 1.0]}]},],
+                                    "axes": [
+                                        {"name": "t", "type": "time", "unit": "minute"},
+                                        {"name": "c", "type": "channel"},
+                                        {"name": "z", "type": "space", "unit": "micrometer"},
+                                        {"name": "y", "type": "space", "unit": "micrometer"},
+                                        {"name": "x", "type": "space", "unit": "micrometer"}],}]
     if metadata:
         root.attrs['metadata'] = metadata
 
@@ -337,16 +371,24 @@ def create_zarr_store(  path: str,
                         shape:tuple, 
                         dtype:str,  
                         chunks:tuple,   
-                        metadata:dict = None):
+                        metadata:dict = None,
+                        voxel_size: list = [1,1,1]):
 
-    store = zarr.DirectoryStore(path+os.sep+pos_name)
+    store = zarr.NestedDirectoryStore(path+os.sep+pos_name)
     root = zarr.group(store=store, overwrite=True)
 
-    root.attrs['multiscale'] = {'multiscales': [{'version': '0.3', 
-                                                    'name': name+'_'+pos_name+'.zarr', 
-                                                    'datasets': [{'path': '0'}],
-                                                    'axes': ['t','c','z','y','x']}]}
-    if metadata:
+    root.attrs['multiscales'] = [{'version': '0.4', 
+                                    'name': name+'_'+pos_name, 
+                                    'datasets': [{'path': '0',                     
+                                                    "coordinateTransformations": [{"type": "scale",
+                                                                                    "scale": [1.0, 1.0]+voxel_size}]},],
+                                    "axes": [
+                                        {"name": "t", "type": "time", "unit": "minute"},
+                                        {"name": "c", "type": "channel"},
+                                        {"name": "z", "type": "space", "unit": "micrometer"},
+                                        {"name": "y", "type": "space", "unit": "micrometer"},
+                                        {"name": "x", "type": "space", "unit": "micrometer"}],}]
+    if metadata is not None:
         root.attrs['metadata'] = metadata
 
     compressor = Blosc(cname='zstd', clevel=5, shuffle=Blosc.BITSHUFFLE)

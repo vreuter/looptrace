@@ -1,0 +1,170 @@
+#       PARAMETERS FOR IMAGE PROCESSING AND TRACING        #
+# -------------------------------------------------------- #
+
+#Path and file definitions:
+analysis_prefix: date_initials_expID_          #Prefix for analysis output filenames.
+
+#General imaging properties (used for calibration and deconvolution)
+xy_nm: 110                                           #Camera pixel size [nm]
+z_nm: 300                                           #Z-slice spacing
+
+#Parameters for nucleus analysis
+nuc_input_name: nuc_images_zarr                        #
+nuc_channel: 1                                      #The image channel (0-based) where nuclei are imaged.
+nuc_ref_frame: 0                                    #Which image frame nuclei should be detected in.
+nuc_3d: False                                       #Run nucleus analysis in 3D (True/False)
+nuc_slice: 10                                       #If not using nuc_3D segmentation, select which slice to use for nucleus. Setting to -1 will use a max projection instead.
+nuc_method: cellpose                                      #Segmentation model used for nuclei segmentation. Options: rf: random forest, nuclei: CellPose nuclei model.
+nuc_dilation: 2                                     #How much to dilate nuclear masks after detection [px]
+#CellPose params:
+nuc_diameter: 150                                   #Approximate diameter of nuclei in images [px]
+nuc_anisotropy: 1                                   # Only for 3D, anisotropy between z and xy
+nuc_downscaling_xy: 4                               # Downsampling for xy
+nuc_downscaling_z: 2                                # Only for 3D: downsampling in z
+nuc_mitosis_class: False                            # Extra (crude) classification of mitotic cell
+
+#Decon parameters:
+psf_input_name: seq_images_zarr
+psf_bead_ch: 0
+psf_bead_frame: 0
+psf_bead_size: 12
+decon_input_name: seq_images_zarr
+decon_ch: 
+    - 1
+non_decon_ch:
+decon_iter: 60                                      #Number of deconvolution iterations, 0 is off.
+decon_psf: exp                                      # PSF used for decon, can be "exp" for experimental or "gen" for a generated one.
+#Only necessary if generated PSF is used:
+spot_wavelength: 600                                #Approximate emmision wavelength of FISH probe.
+objective_na: 1.40                                  #Numerical aperture of objective
+
+#Registration parameters (NB! 0-based, also the timepoints):
+reg_input_template: seq_images_zarr                     #Image name in images folder of template
+reg_input_moving: seq_images_zarr                       #Image name in images folder of moving image
+reg_ch_template: 0                                          #The channel of the fiducial beads/marks in the template  
+reg_ch_moving: 0                                #The channel of the fiducial beads/marks in the moving image 
+reg_ref_frame : 20                            #The frame used as reference of the drift correction
+bead_threshold: 1000                                #Minimum intensity for bead detection
+min_bead_intensity: 4000                            #Minimum intensity for bead segmentation
+bead_roi_size: 8                                     # Size of bead ROI in px.
+bead_points: 200                                    #Maximum number of beads to segment
+course_drift_downsample: 2                          #Factor to downsample course drift correction to speed up calculation.
+dc_method: fit                                      #Choice of drift correction method, can be "course" (only downsampled cc), "fit" (guassian fitting of fiducials), "cc" (upsampled cross-correlation of fiducials), or "cc_blocks" (upsampled cross-correlation of random blocks of reg_ch)
+#dc_method: course
+#bead_trace_fields: 8                                #Number of fields of view to sample beads from for bead QC tracing.
+#bead_trace_number: 15                               #Number of beads per field of view to sample for bead QC tracing.
+
+#Chromatic abberation correction (use if e.g. tetraspeck beads imaged in multiple channels):
+chrom_abb_image_name: seq_images_zarr            #Name of image to use to chromatin abberation correction
+chrom_abb_detect_channel: 2                     #Channel to detect fiducials used for chromatin abberation correction
+chrom_abb_reference_channel: 1                        #Reference channel for chromatin abberation
+chrom_abb_corr_channels: 0                      #Channels to correct for chromatin abberation
+chrom_abb_frame: 0                              #Frame to use in dataset for correction
+chrom_abb_bead_threshold: 2000                  #Minimum threshold (using peak_local_max) for bead detection
+chrom_abb_bead_size: 6                          #Size to crop bead ROI for gaussian fitting
+
+#Spot detection parameters (NB! 0-based, also the timepoints):
+spot_input_name: seq_images_zarr                    #Image name to detect spots in
+spot_ch: 1                                         #Which channel(s) to detect spots in (make list if multiple channels)
+spot_frame:                                         #(Int or list) Frame(s) where spots are to be detected for segmentation. Tracing is done in all frames.
+    - 31
+    - 32
+    - 33
+    - 34
+    - 35
+    - 36
+    - 40
+detection_method: intensity                           # Algorithm for regional spot detection. Can be intensity (simple threshold, when spots are bright), dog (difference of gaussian when spots are dimmer), sbr (set signal to background ratio) or random forest (train first in separate notebook).
+spot_threshold: #(Int or list) of intensities/DoG intensities, SBR values. Not used for random forest.                                      
+    - 1500
+    - 1500
+    - 1500
+    - 1500
+    - 2000
+    - 3000
+    - 20000
+spot_downsample: 1                                  #Downsampling (int) for spot detection (not fitting).
+spot_in_nuc: False                                   #Only filter for spots inside nuclear masks.
+subtract_crosstalk: False                                # Reduce cross-talk from beads for spot detection (not spot fitting).
+crosstalk_ch: 0                                     #Ch to subtract crosstalk, if used.
+min_spot_dist: 8                                   # Filter for minimum distance in pixels between detected spots.
+preserve_spot: brightest                            # If spots are nearby, choose which to preserve: 'brightest' or 'first'.
+spot_dilate: 5                                     # Dilation of spots
+
+spot_extract_name: seq_images_zarr_decon            #Image to extract spot ROIs for tracing.
+spot_extract_ch:                                    #Channel(s) to extract spot ROIs for tracing (channel in spot_extract_name image!)
+    - 0
+
+#Tracing parameters
+trace_input_name: spot_images                       #Name of images used for tracing
+fit_func: LS                                        #Use LS or MLE solvers for spot fitting.
+mask_fits: True                                     # Weight fitting initialization 
+#substract_background: -1                            #Background/blank frame to subtract.
+#Size of region segmented around each detected spot for tracing:
+#roi_image_size:
+#    - 16
+#    - 32
+#    - 32
+#    
+#           PARAMETERS FOR ANALYSIS POST TRACING           #
+# -------------------------------------------------------- #
+#Tracing QC parameters, will often need to be empirically determined:
+A_to_BG: 2             #Minimum signal to background of gaussian fit to accept
+sigma_xy_max: 150       #Maximum std in xy of gaussian fit [nm]
+sigma_z_max: 400            #Maximum std in z of gaussian fit [nm]
+max_dist: 800           #Maximum 3D distance from reference spot that a detected spot can be [nm]
+
+#List of barcodes/identifiers used in each of the sequential imaging frames:
+#If tracing in multiple channels, use syntax 
+#frame_name:   
+#    ch_0:  
+#       - bc_1 
+#       - bc_2
+#    ch_1:
+#        - bc_3
+#        - bc_4
+#     etc...
+     
+frame_name:
+    - pre_image
+    - Dp001
+    - Dp002
+    - Dp003
+    - Dp006
+    - Dp007
+    - Dp009
+    - Dp010
+    - Dp011
+    - Dp012
+    - Dp013
+    - Dp014
+    - Dp015
+    - Dp017
+    - Dp018
+    - Dp020
+    - Dp021
+    - Dp025
+    - Dp027
+    - Dp028
+    - Dp032
+    - Dp033
+    - Dp035
+    - Dp036
+    - Dp038
+    - Dp005
+    - Dp008
+    - Dp016
+    - Dp019
+    - Dp024
+    - Dp029
+    - Dp101
+    - Dp102
+    - Dp103
+    - Dp104
+    - Dp105
+    - Dp107
+    - Dp002_rep
+    - Dp015_rep
+    - Dp036_rep
+    - Dp150
+    - blank
